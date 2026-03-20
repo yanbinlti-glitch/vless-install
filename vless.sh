@@ -270,6 +270,10 @@ generate_singbox_config() {
         yellow "  正在生成 Reality 密钥对..."
         local keys=$(/usr/local/bin/sing-box generate reality-keypair)
         local private_key=$(echo "$keys" | grep "PrivateKey" | awk -F': ' '{print $2}')
+        # [修复点 1]：提取公钥并持久化保存
+        local public_key=$(echo "$keys" | grep "PublicKey" | awk -F': ' '{print $2}')
+        echo "$public_key" > /usr/local/etc/sing-box/public_key.meta
+        
         local short_id=$(openssl rand -hex 8)
         json_content=$(cat <<EOF
 {
@@ -362,7 +366,8 @@ generate_client_configs() {
     local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
 
     if [[ "$is_reality" == "true" ]]; then
-        local pbk=$(jq -r '.inbounds[0].tls.reality.private_key' $cfg | xargs -I {} /usr/local/bin/sing-box generate reality-keypair | grep PublicKey | awk '{print $2}')
+        # [修复点 2]：直接读取刚才生成的公钥，而不是重新推导
+        local pbk=$(cat /usr/local/etc/sing-box/public_key.meta 2>/dev/null)
         local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)
         url="vless://${uuid}@${uri_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${domain}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${safe_node_name}"
         clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${uri_ip}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: \"${pbk}\"\n      short-id: \"${sid}\""
