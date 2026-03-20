@@ -81,6 +81,7 @@ gen_random_str() {
     echo "${str:0:$len}"
 }
 
+# 【优化 1】修复防火墙规则冗余 (先删后加)
 open_port() {
     local port=$1
     if command -v ufw >/dev/null && ufw status | grep -qw active; then
@@ -89,12 +90,15 @@ open_port() {
         firewall-cmd --zone=public --add-port=$port/tcp --permanent >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
     else
+        iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+        ip6tables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
         iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
         ip6tables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
         if [[ $SYSTEM == "Alpine" ]]; then rc-service iptables save 2>/dev/null; elif command -v netfilter-persistent >/dev/null; then netfilter-persistent save 2>/dev/null; fi
     fi
 }
 
+# 【优化 1】修复防火墙规则冗余 (循环彻底清除)
 close_port() {
     local port=$1
     if command -v ufw >/dev/null && ufw status | grep -qw active; then
@@ -103,8 +107,12 @@ close_port() {
         firewall-cmd --zone=public --remove-port=$port/tcp --permanent >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
     else
-        iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        ip6tables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+        while iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+        done
+        while ip6tables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+        done
         if [[ $SYSTEM == "Alpine" ]]; then rc-service iptables save 2>/dev/null; elif command -v netfilter-persistent >/dev/null; then netfilter-persistent save 2>/dev/null; fi
     fi
 }
@@ -149,6 +157,7 @@ check_env() {
     green "  [✔] 所有前置依赖补全完成！"; sleep 1
 }
 
+# 【优化 4】优化 GitHub API 速率限制问题
 inst_singbox_core() {
     echo ""; print_line; yellow "  正在下载 sing-box 二进制核心..."; 
     local arch=$(uname -m); local sb_arch=""
@@ -159,7 +168,7 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
-    local sb_version=$(curl -Ls -o /dev/null -w %{url_effective} "https://github.com/SagerNet/sing-box/releases/latest" | grep -oP 'tag/v?\K.*')
+    local sb_version=$(curl -Ls -o /dev/null -w %{url_effective} "https://github.com/SagerNet/sing-box/releases/latest" | sed 's|.*/tag/v||')
     [[ -z "$sb_version" ]] && sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
     [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败！" && exit 1
     
@@ -234,8 +243,13 @@ collect_tls_info() {
     collect_base_info
 }
 
+# 【优化 2】增加 Cloudflare ALPN 警告
 collect_ws_info() {
     echo ""; print_line; green "            配置 VLESS + WS + TLS (CDN 救星)            "; print_line; echo ""
+    red "  ⚠️ [重要警告] 如果您使用 Cloudflare 等 CDN 服务，请务必先将域名解析设置为"
+    red "               【仅 DNS (灰云)】状态！等脚本部署完成且证书申请成功后，"
+    red "               再到 CDN 面板开启代理 (小黄云)，否则将导致 TLS 证书申请失败！"
+    echo ""
     while true; do
         echo -en " ${LIGHT_YELLOW} ▶ 请输入真实域名 (若套 CDN，请确保 SSL 设为 Full Strict): ${PLAIN}"
         read NODE_DOMAIN
@@ -256,7 +270,7 @@ collect_ws_info() {
 }
 
 # =================================================================
-#  5. 配置动态装配与智能客户端下发 (已修复动态 Flow 识别)
+#  5. 配置动态装配与智能客户端下发
 # =================================================================
 generate_singbox_config() {
     mkdir -p /usr/local/etc/sing-box
@@ -344,6 +358,7 @@ EOF
     open_port $NODE_PORT; open_port $SUB_PORT
 }
 
+# 【优化 3】优化 Python 服务端：取消内存死缓存，动态读取订阅内容
 generate_client_configs() {
     realip
     local cfg="/usr/local/etc/sing-box/config.json"
@@ -357,7 +372,6 @@ generate_client_configs() {
     local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
     local is_ws=$(jq -r '.inbounds[0].transport.type // "tcp"' $cfg)
     
-    # 【修复核心】：动态侦测 Flow 状态，智能同步给客户端
     local flow=$(jq -r '.inbounds[0].users[0].flow // empty' $cfg)
     local flow_url=""
     local clash_flow=""
@@ -422,13 +436,9 @@ EOF
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     
     cat << EOF > "$web_dir/vless_server.py"
-import http.server, socketserver, urllib.parse, socket
+import http.server, socketserver, urllib.parse, socket, os
 PORT = $sub_port
 SUB_UUID = "$sub_uuid"
-try:
-    with open("$web_dir/$sub_uuid/clash-meta-sub.yaml", 'rb') as f: CLASH_DATA = f.read()
-    with open("$web_dir/$sub_uuid/sub_b64.txt", 'rb') as f: B64_DATA = f.read()
-except FileNotFoundError: CLASH_DATA = b""; B64_DATA = b""
 
 class SecureSubHandler(http.server.BaseHTTPRequestHandler):
     server_version = "nginx/1.24.0"; sys_version = ""
@@ -439,9 +449,16 @@ class SecureSubHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
+            
+            try:
+                with open("$web_dir/$sub_uuid/clash-meta-sub.yaml", 'rb') as f: clash_data = f.read()
+                with open("$web_dir/$sub_uuid/sub_b64.txt", 'rb') as f: b64_data = f.read()
+            except FileNotFoundError:
+                clash_data = b""; b64_data = b""
+
             ua = self.headers.get('User-Agent', '').lower()
-            if any(x in ua for x in ['clash', 'meta', 'verge', 'stash', 'mihomo']): self.wfile.write(CLASH_DATA)
-            else: self.wfile.write(B64_DATA + b"\n")
+            if any(x in ua for x in ['clash', 'meta', 'verge', 'stash', 'mihomo']): self.wfile.write(clash_data)
+            else: self.wfile.write(b64_data + b"\n")
         else:
             self.send_response(403)
             self.send_header('Content-type', 'text/html; charset=utf-8')
@@ -664,9 +681,7 @@ showconf() {
     echo ""; print_line; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
-# =================================================================
-#  静态住宅 IP 专属落地配置 (修复 443 端口 HTTPS 代理支持 + Alpine兼容)
-# =================================================================
+# 【优化 5 & 6】住宅 IP 一键 URI 导入，修复 curl HTTPS 代理测试误报
 setup_chain_outbound() {
     clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
     local cfg="/usr/local/etc/sing-box/config.json"
@@ -674,15 +689,15 @@ setup_chain_outbound() {
     
     if [[ ! -f $cfg ]]; then red "  [错误] 未检测到配置，请先安装服务！"; sleep 2; return; fi
 
-    echo -e "  静态住宅 IP 通常由代理服务商提供，格式多为 Socks5 或 HTTP。"
-    echo -e "  配置后，您的节点将通过该住宅 IP 访问目标网站，实现原生 IP 解锁。"
+    echo -e "  支持使用标准 URI 格式一键配置落地节点，实现原生 IP 解锁。"
+    echo -e "  支持协议: ${LIGHT_PURPLE}socks5://, http://, https://${PLAIN}"
+    echo -e "  格式示例: ${LIGHT_YELLOW}socks5://username:password@1.2.3.4:1080${PLAIN} (无密码可省去 user:pass@)"
     echo ""
-    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}Socks5 住宅 IP 落地${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_YELLOW}HTTP 住宅 IP 落地${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_GREEN}测试当前落地 IP 连通性与归属地 🔍${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}一键导入代理 URI (Socks5/HTTP/HTTPS)${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_GREEN}测试当前落地 IP 连通性与归属地 🔍${PLAIN}"
     echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}恢复直连 (撤销住宅 IP，恢复 Direct)${PLAIN}"
     echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请选择代理协议 [0-3]: ${PLAIN}"; read out_type
+    echo -en " ${LIGHT_YELLOW} ▶ 请选择操作 [0-2]: ${PLAIN}"; read out_type
 
     # 0. 恢复直连
     if [[ "$out_type" == "0" ]]; then
@@ -699,8 +714,8 @@ setup_chain_outbound() {
         fi
     fi
 
-    # 3. 测试连通性
-    if [[ "$out_type" == "3" ]]; then
+    # 2. 测试连通性
+    if [[ "$out_type" == "2" ]]; then
         echo ""; print_line
         local cur_type=$(jq -r '.outbounds[] | select(.tag == "proxy") | .type' "$cfg" 2>/dev/null)
         local is_tls=$(jq -r '.outbounds[] | select(.tag == "proxy") | .tls.enabled // false' "$cfg" 2>/dev/null)
@@ -717,7 +732,6 @@ setup_chain_outbound() {
             if [[ "$cur_type" == "socks" ]]; then
                 [[ -n "$cur_user" ]] && proxy_url="socks5h://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="socks5h://${cur_ip}:${cur_port}"
             elif [[ "$cur_type" == "http" ]]; then
-                # 兼容 HTTPS 代理测试
                 if [[ "$is_tls" == "true" ]]; then
                     [[ -n "$cur_user" ]] && proxy_url="https://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="https://${cur_ip}:${cur_port}"
                 else
@@ -744,56 +758,89 @@ setup_chain_outbound() {
                 red "  [✘] 测试失败！无法连接到该代理。"
                 echo -e "      ${LIGHT_PURPLE}排错指南：${PLAIN}"
                 echo "      1. 代理服务器宕机 / 额度耗尽 / IP未加白名单"
-                echo "      2. 端口为 443 时，可能需要开启 TLS 加密 (重新配置并选y)"
+                echo "      2. URI 格式拼写错误 (特别是包含特殊字符的密码)"
+                if [[ "$is_tls" == "true" && "$cur_type" == "http" ]]; then
+                    yellow "      3. ⚠️ 注意: 您开启了 HTTPS 代理，部分旧系统 curl 版本过低可能导致测试误报，可直接到客户端连接测试。"
+                fi
             fi
         fi
         echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
         return
     fi
 
-    # 1 & 2. 配置新的落地节点
-    if [[ "$out_type" == "1" || "$out_type" == "2" ]]; then
-        echo -en " ${LIGHT_YELLOW} ▶ 住宅 IP 地址 (Server IP/域名): ${PLAIN}"; read out_ip
-        echo -en " ${LIGHT_YELLOW} ▶ 端口 (Port): ${PLAIN}"; read out_port
+    # 1. 解析 URI 并配置节点
+    if [[ "$out_type" == "1" ]]; then
+        echo -en " ${LIGHT_YELLOW} ▶ 请粘贴代理 URI: ${PLAIN}"; read proxy_uri
         
-        [[ -z "$out_ip" || -z "$out_port" ]] && { red "  [错误] IP 和 端口不能为空！操作取消。"; sleep 2; return; }
+        [[ -z "$proxy_uri" ]] && { red "  [错误] 链接不能为空！操作取消。"; sleep 2; return; }
 
-        echo -en " ${LIGHT_YELLOW} ▶ 认证用户名 (Username, 若无请留空直接回车): ${PLAIN}"; read out_user
-        echo -en " ${LIGHT_YELLOW} ▶ 认证密码 (Password, 若无请留空直接回车): ${PLAIN}"; read out_pass
+        local proto=$(echo "$proxy_uri" | awk -F'://' '{print $1}' | tr '[:upper:]' '[:lower:]')
+        local rest=$(echo "$proxy_uri" | awk -F'://' '{print $2}')
         
-        # 新增：代理底层 TLS 询问
-        echo -en " ${LIGHT_YELLOW} ▶ 该代理是否需要 TLS 加密传输 (HTTPS 代理)？(提示: 端口为 443 强烈建议选 y) [y/n] 默认 n: ${PLAIN}"; read out_tls
+        if [[ -z "$rest" || -z "$proto" ]]; then
+            red "  [错误] 链接格式不正确！请包含协议头 (如 socks5://)。"; sleep 2; return
+        fi
 
-        # 生成基本出站结构 (去除 Vision flow)
-        if [[ "$out_type" == "1" ]]; then
+        local out_user="" out_pass="" out_host="" out_port=""
+        if [[ "$rest" == *"@"* ]]; then
+            local cred=$(echo "$rest" | awk -F'@' '{print $1}')
+            local hostport=$(echo "$rest" | awk -F'@' '{print $2}')
+            out_user=$(echo "$cred" | awk -F':' '{print $1}')
+            out_pass=$(echo "$cred" | awk -F':' '{print $2}')
+            out_host=$(echo "$hostport" | awk -F':' '{print $1}')
+            out_port=$(echo "$hostport" | awk -F':' '{print $2}' | tr -d '/')
+        else
+            out_host=$(echo "$rest" | awk -F':' '{print $1}')
+            out_port=$(echo "$rest" | awk -F':' '{print $2}' | tr -d '/')
+        fi
+
+        if [[ -z "$out_host" || -z "$out_port" ]]; then
+            red "  [错误] 无法解析出服务器 IP/域名 或 端口！"; sleep 2; return
+        fi
+
+        local sb_type=""
+        local enable_tls="false"
+
+        if [[ "$proto" == "socks5" || "$proto" == "socks" ]]; then
+            sb_type="socks"
+        elif [[ "$proto" == "http" ]]; then
+            sb_type="http"
+        elif [[ "$proto" == "https" ]]; then
+            sb_type="http"
+            enable_tls="true"
+        else
+            red "  [错误] 不支持的协议: $proto (仅支持 socks5, http, https)"; sleep 2; return
+        fi
+
+        green "  [✔] 解析成功: 协议=${proto}, 地址=${out_host}, 端口=${out_port}, 用户=${out_user:-无}"
+
+        if [[ "$sb_type" == "socks" ]]; then
             if [[ -n "$out_user" ]]; then
-                jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
+                jq --arg ip "$out_host" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
                 'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             else
-                jq --arg ip "$out_ip" --arg port "$out_port" \
+                jq --arg ip "$out_host" --arg port "$out_port" \
                 'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             fi
-        elif [[ "$out_type" == "2" ]]; then
+        elif [[ "$sb_type" == "http" ]]; then
             if [[ -n "$out_user" ]]; then
-                jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
+                jq --arg ip "$out_host" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
                 'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             else
-                jq --arg ip "$out_ip" --arg port "$out_port" \
+                jq --arg ip "$out_host" --arg port "$out_port" \
                 'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber) }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             fi
         fi
 
-        # 注入 TLS 设定
-        if [[ "$out_tls" == "y" || "$out_tls" == "Y" ]]; then
+        if [[ "$enable_tls" == "true" ]]; then
             jq '.outbounds[0] += {"tls": {"enabled": true}}' "$tmp_cfg" > "${tmp_cfg}.tls"
             mv -f "${tmp_cfg}.tls" "$tmp_cfg"
         fi
 
-        # 分流与路由处理
         echo ""; print_line
         echo -e "  是否开启【流媒体与 AI 智能分流】？"
         echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 n (全局走代理)]: ${PLAIN}"; read enable_route
@@ -819,7 +866,7 @@ setup_chain_outbound() {
             if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
             generate_client_configs
             echo ""; print_line
-            green "  🎉 静态住宅 IP 落地配置完成！"
+            green "  🎉 代理落地节点配置完成！"
             purple "  💡 重要提示：请务必在您的代理客户端 (v2rayN/Clash 等) 中【更新一次订阅】！"
             sleep 4
         else
@@ -877,7 +924,7 @@ menu() {
     echo -e "${LIGHT_GREEN}  ██████╔╝ ╚██████╔╝ ╚██████╔╝███████╗ ██║  ██║${PLAIN}"
     echo -e "${LIGHT_GREEN}  ╚═════╝   ╚══════╝  ╚═════╝ ╚══════╝ ╚═╝  ╚═╝${PLAIN}"
     green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green " 项目名称 ：VLESS 多模式全能部署与管理脚本 (电竞加固版)"
+    green " 项目名称 ：VLESS 多模式全能部署与管理脚本 (修复升级版)"
     purple " 项目地址 ：哆啦的Github库 https://github.com/yanbinlti-glitch/vless-install"
     green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     yellow " 脚本快捷方式：vvv (已自动配置，下次可在终端直接输入 vvv 启动)"
