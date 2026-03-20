@@ -662,59 +662,167 @@ showconf() {
 }
 
 # =================================================================
-#  新增：配置中转落地 (链式代理 Outbound)
+#  静态住宅 IP 专属落地配置 (极致优化版) - 功能 7
 # =================================================================
 setup_chain_outbound() {
-    clear; echo ""; print_line; green "                  配置中转落地 (链式代理 Outbound)                  "; print_line; echo ""
+    clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
     local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置，请先安装服务！"; sleep 2; return; fi
+    local tmp_cfg="/tmp/sb_tmp.json"
+    
+    if [[ ! -f $cfg ]]; then red "  [错误] 未检测到配置，请先安装服务！"; sleep 2; return; fi
 
-    echo -e "  当前出站规则将转发您的所有流量，可选以下协议连接至落地节点："
+    echo -e "  静态住宅 IP 通常由代理服务商提供，格式多为 Socks5 或 HTTP。"
+    echo -e "  配置后，您的节点将通过该住宅 IP 访问目标网站，实现原生 IP 解锁。"
     echo ""
-    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}Socks5 落地${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_YELLOW}Shadowsocks 落地${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}Trojan 落地${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}恢复直连 (撤销中转，恢复 Direct)${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}Socks5 住宅 IP 落地${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_YELLOW}HTTP 住宅 IP 落地${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_GREEN}测试当前落地 IP 连通性与归属地 🔍${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}恢复直连 (撤销住宅 IP，恢复 Direct)${PLAIN}"
     echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请选择落地协议 [0-3]: ${PLAIN}"; read out_type
+    echo -en " ${LIGHT_YELLOW} ▶ 请选择代理协议 [0-3]: ${PLAIN}"; read out_type
 
+    # 0. 恢复直连
     if [[ "$out_type" == "0" ]]; then
-        jq '.outbounds = [{ "type": "direct", "tag": "direct" }]' $cfg > /tmp/sb_tmp.json
-        mv /tmp/sb_tmp.json $cfg
-        systemctl restart sing-box
-        green "  已撤销中转节点，恢复为直连模式！"; sleep 2; return
+        if jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }]' "$cfg" > "$tmp_cfg"; then
+            mv -f "$tmp_cfg" "$cfg"
+            systemctl restart sing-box
+            green "  [✔] 已撤销住宅 IP 落地，恢复为 VPS 全局直连模式！"; sleep 2; return
+        else
+            red "  [✘] 配置文件修改失败！"; sleep 2; return
+        fi
     fi
 
-    echo -en " ${LIGHT_YELLOW} ▶ 请输入落地节点 IP/域名: ${PLAIN}"; read out_ip
-    echo -en " ${LIGHT_YELLOW} ▶ 请输入落地节点 端口: ${PLAIN}"; read out_port
-
-    if [[ "$out_type" == "1" ]]; then
-        echo -en " ${LIGHT_YELLOW} ▶ Socks5 用户名 (若无请留空直接回车): ${PLAIN}"; read out_user
-        echo -en " ${LIGHT_YELLOW} ▶ Socks5 密码 (若无请留空直接回车): ${PLAIN}"; read out_pass
-        if [[ -n "$out_user" ]]; then
-            jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+    # 3. 测试连通性
+    if [[ "$out_type" == "3" ]]; then
+        echo ""; print_line
+        local cur_type=$(jq -r '.outbounds[] | select(.tag == "proxy") | .type' "$cfg" 2>/dev/null)
+        
+        if [[ -z "$cur_type" ]]; then
+            yellow "  当前未配置落地节点 (处于 VPS 直连模式)，无需测试。"
         else
-            jq --arg ip "$out_ip" --arg port "$out_port" '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+            local cur_ip=$(jq -r '.outbounds[] | select(.tag == "proxy") | .server' "$cfg")
+            local cur_port=$(jq -r '.outbounds[] | select(.tag == "proxy") | .server_port' "$cfg")
+            local cur_user=$(jq -r '.outbounds[] | select(.tag == "proxy") | .username // empty' "$cfg")
+            local cur_pass=$(jq -r '.outbounds[] | select(.tag == "proxy") | .password // empty' "$cfg")
+            
+            local proxy_url=""
+            if [[ "$cur_type" == "socks" ]]; then
+                # 优化: 使用 socks5h 强制远端解析 DNS
+                [[ -n "$cur_user" ]] && proxy_url="socks5h://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="socks5h://${cur_ip}:${cur_port}"
+            elif [[ "$cur_type" == "http" ]]; then
+                [[ -n "$cur_user" ]] && proxy_url="http://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="http://${cur_ip}:${cur_port}"
+            else
+                red "  当前配置的落地协议 ($cur_type) 不支持快捷测试。"
+                sleep 2; return
+            fi
+
+            yellow "  正在通过代理连接测试网络 (Timeout: 10s)..."
+            local test_ip=$(curl -x "$proxy_url" -sL -m 10 https://api.ipify.org 2>/dev/null)
+            
+            if [[ -n "$test_ip" && "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                green "  [✔] 连通性测试成功！"
+                yellow "  ▶ 代理入口地址: $cur_ip:$cur_port"
+                yellow "  ▶ 实际出口 IP : $test_ip"
+                
+                # 获取 IP 归属地和 ISP 信息
+                local ip_info=$(curl -x "$proxy_url" -sL -m 10 "http://ip-api.com/json/$test_ip?lang=zh-CN" 2>/dev/null)
+                local country=$(echo "$ip_info" | jq -r '.country // "未知"')
+                local isp=$(echo "$ip_info" | jq -r '.isp // "未知"')
+                purple "  ▶ 归属地信息  : $country | ISP: $isp"
+            else
+                red "  [✘] 测试失败！无法连接到该代理。"
+                echo -e "      ${LIGHT_PURPLE}排错指南：${PLAIN}"
+                echo "      1. 代理服务器是否宕机 / 流量额度是否耗尽"
+                echo "      2. 服务商的 IP 白名单中，是否已添加当前 VPS 的 IP"
+                echo "      3. 账号密码、端口是否填写错误"
+            fi
         fi
-    elif [[ "$out_type" == "2" ]]; then
-        echo -en " ${LIGHT_YELLOW} ▶ 加密方式 (如 aes-256-gcm): ${PLAIN}"; read out_method
-        echo -en " ${LIGHT_YELLOW} ▶ 密码: ${PLAIN}"; read out_pass
-        jq --arg ip "$out_ip" --arg port "$out_port" --arg method "$out_method" --arg pass "$out_pass" '.outbounds = [{ "type": "shadowsocks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "method": $method, "password": $pass }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
-    elif [[ "$out_type" == "3" ]]; then
-        echo -en " ${LIGHT_YELLOW} ▶ 密码: ${PLAIN}"; read out_pass
-        echo -en " ${LIGHT_YELLOW} ▶ SNI 伪装域名 (若无请留空，默认使用IP): ${PLAIN}"; read out_sni
-        [[ -z "$out_sni" ]] && out_sni="$out_ip"
-        jq --arg ip "$out_ip" --arg port "$out_port" --arg pass "$out_pass" --arg sni "$out_sni" '.outbounds = [{ "type": "trojan", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "password": $pass, "tls": {"enabled": true, "server_name": $sni} }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+        echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
+        return
+    fi
+
+    # 1 & 2. 配置新的落地节点
+    if [[ "$out_type" == "1" || "$out_type" == "2" ]]; then
+        echo -en " ${LIGHT_YELLOW} ▶ 住宅 IP 地址 (Server IP/域名): ${PLAIN}"; read out_ip
+        echo -en " ${LIGHT_YELLOW} ▶ 端口 (Port): ${PLAIN}"; read out_port
+        
+        # 优化: 拦截空输入防呆
+        [[ -z "$out_ip" || -z "$out_port" ]] && { red "  [错误] IP 和 端口不能为空！操作取消。"; sleep 2; return; }
+
+        echo -en " ${LIGHT_YELLOW} ▶ 认证用户名 (Username, 若无请留空直接回车): ${PLAIN}"; read out_user
+        echo -en " ${LIGHT_YELLOW} ▶ 认证密码 (Password, 若无请留空直接回车): ${PLAIN}"; read out_pass
+
+        # 生成 Outbound JSON 结构
+        if [[ "$out_type" == "1" ]]; then
+            if [[ -n "$out_user" ]]; then
+                jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
+                '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
+                "$cfg" > "$tmp_cfg"
+            else
+                jq --arg ip "$out_ip" --arg port "$out_port" \
+                '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' \
+                "$cfg" > "$tmp_cfg"
+            fi
+        elif [[ "$out_type" == "2" ]]; then
+            if [[ -n "$out_user" ]]; then
+                jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
+                '.outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
+                "$cfg" > "$tmp_cfg"
+            else
+                jq --arg ip "$out_ip" --arg port "$out_port" \
+                '.outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber) }, {"type":"direct", "tag":"direct"}]' \
+                "$cfg" > "$tmp_cfg"
+            fi
+        fi
+
+        # 优化: 如果基础配置生成失败，直接熔断
+        if [[ ! -s "$tmp_cfg" ]]; then
+            red "  [错误] 基础代理配置生成失败！(可能是 jq 解析错误)"
+            rm -f "$tmp_cfg"; sleep 2; return
+        fi
+
+        # 智能分流设置
+        echo ""; print_line
+        echo -e "  是否开启【流媒体与 AI 智能分流】？"
+        echo -e "  (强烈推荐：仅 Netflix/ChatGPT/Disney 等流量走住宅 IP，普通网页走 VPS 原生网络，极致省流加速)"
+        echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 y]: ${PLAIN}"; read enable_route
+        [[ -z "$enable_route" ]] && enable_route="y" # 优化: 默认改为y
+
+        if [[ "$enable_route" == "y" || "$enable_route" == "Y" ]]; then
+            # 定义路由规则 JSON 并安全注入
+            local route_json='{
+                "rules": [
+                    {
+                        "domain_suffix": [".netflix.com", ".nflxvideo.net", ".nflximg.net", ".openai.com", ".chatgpt.com", ".disneyplus.com", ".dssott.com", ".ipify.org"],
+                        "domain_keyword": ["netflix", "openai", "disney"],
+                        "outbound": "proxy"
+                    }
+                ],
+                "final": "direct"
+            }'
+            jq --argjson route "$route_json" '.route = $route' "$tmp_cfg" > "${tmp_cfg}.2"
+            mv -f "${tmp_cfg}.2" "$tmp_cfg"
+            green "  [✔] 已附加智能分流规则 (流媒体/AI 走代理，其余直连)！"
+        else
+            jq 'del(.route)' "$tmp_cfg" > "${tmp_cfg}.2"
+            mv -f "${tmp_cfg}.2" "$tmp_cfg"
+            yellow "  [!] 未开启分流，已设置为全局流量转发至静态住宅 IP。"
+        fi
+
+        # 最终应用配置
+        if [ -s "$tmp_cfg" ]; then
+            mv -f "$tmp_cfg" "$cfg"
+            systemctl restart sing-box
+            echo ""; print_line
+            green "  🎉 静态住宅 IP 落地配置完成，sing-box 服务已成功重启并接管流量！"
+            purple "  💡 提示：您可以再次进入此菜单，选择 [3] 测试刚才配置的代理是否连通。"
+            sleep 3
+        else
+            red "  [错误] 配置文件最终写入失败！"
+            rm -f "$tmp_cfg"; sleep 2
+        fi
     else
         red "  无效的选择！操作取消。"; sleep 2; return
-    fi
-
-    if [ -s /tmp/sb_tmp.json ]; then
-        mv -f /tmp/sb_tmp.json $cfg
-        systemctl restart sing-box
-        green "  [✔] 中转落地配置完成，sing-box 服务已成功重启并接管流量！"; sleep 3
-    else
-        red "  [错误] 配置文件解析或写入失败！"; sleep 2
     fi
 }
 
@@ -777,7 +885,7 @@ menu() {
     echo -e "  ${LIGHT_GREEN}[5]${PLAIN} ${LIGHT_GREEN}修改 伪装域名 (SNI / 真实域名)${PLAIN}"
     echo "----------------------------------------------------------------------------------"
     echo -e "  ${LIGHT_GREEN}[6]${PLAIN} ${LIGHT_GREEN}获取 节点配置 与 订阅链接${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[7]${PLAIN} ${LIGHT_YELLOW}配置 中转落地 (链式代理 Outbound)${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[7]${PLAIN} ${LIGHT_YELLOW}配置 静态住宅 IP 落地 (防封锁/原生解锁)${PLAIN}"
     echo -e "  ${LIGHT_GREEN}[8]${PLAIN} ${LIGHT_PURPLE}开启 BBR 拥塞控制调优 (强烈推荐)${PLAIN}"
     echo -e "  ${LIGHT_GREEN}[9]${PLAIN} ${LIGHT_GREEN}检查 核心安全密钥与参数状态${PLAIN}"
     echo "----------------------------------------------------------------------------------"
