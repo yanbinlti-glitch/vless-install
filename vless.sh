@@ -221,8 +221,12 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
-    sb_version=$(curl -Ls -o /dev/null -w %{url_effective} https://github.com/SagerNet/sing-box/releases/latest | awk -F'/' '{print $NF}' | sed 's/^v//')
-    [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败，请检查网络！" && exit 1
+    # 修复：使用更稳定的 GitHub API 解析 JSON 提取最新版本号，防 Rate Limit 报错
+    sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    if [[ -z "$sb_version" || ! "$sb_version" =~ ^[0-9]+\.[0-9]+ ]]; then
+        red " [错误] 获取 sing-box 最新版本失败，可能是网络问题或 GitHub API 请求受限！"
+        exit 1
+    fi
     
     green "  获取到最新版本: v${sb_version}"
     wget --timeout=10 --tries=3 -N -v -O /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${sb_version}/sing-box-${sb_version}-linux-${sb_arch}.tar.gz"
@@ -239,6 +243,14 @@ inst_singbox_core() {
     chmod +x /usr/local/bin/sing-box
     
     rm -rf /tmp/sing-box.tar.gz /tmp/sing-box-${sb_version}-linux-${sb_arch}
+    
+    # 修复：运行可执行性检查，防止在不支持的内核或缺失库的环境下继续部署
+    if ! /usr/local/bin/sing-box version >/dev/null 2>&1; then
+        red " [致命错误] sing-box 核心无法在当前系统运行！可能是不兼容的架构或缺失底层 C 库。"
+        rm -f /usr/local/bin/sing-box
+        exit 1
+    fi
+    
     green "  sing-box 核心下载并解压完成！"
 }
 
@@ -289,7 +301,6 @@ inst_config() {
     green "  ✔ x25519 密钥对生成成功!"
     green "  ✔ shortId 生成成功!"
 
-    # [已修复] 适配 sing-box v1.13+ 最新版本的 Reality Handshake 语法格式
     cat << EOF > /usr/local/etc/sing-box/config.json
 {
   "log": {
@@ -346,7 +357,6 @@ EOF
 inst_sub_port(){
     echo ""
     print_line
-    # 强制限制订阅端口只能为 10000-65535 的纯数字
     while true; do
         echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [10000-65535] (回车随机): ${PLAIN}"
         read sub_port_input
@@ -408,7 +418,7 @@ generate_client_configs() {
     [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
 
     local web_dir="/var/www/vless"
-    mkdir -p "$web_dir/certs"
+    mkdir -p "$web_dir"
 
     local sub_uuid=$(gen_random_str 16)
     mkdir -p "$web_dir/$sub_uuid"
@@ -462,24 +472,17 @@ EOF
     chmod 644 "$web_dir/$sub_uuid/sub_b64.txt"
 
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.txt)
-    
-    if [[ ! -f "$web_dir/certs/cert.pem" ]]; then
-        openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -subj "/C=US/ST=CA/L=LA/O=VLESS/CN=sub.server" -keyout "$web_dir/certs/key.pem" -out "$web_dir/certs/cert.pem" 2>/dev/null
-    fi
     chown -R nobody "$web_dir"
 
+    # 修复：移除有兼容性问题的自签 HTTPS 证书，改为纯 HTTP，保证各客户端正常拉取订阅
     cat << EOF > "$web_dir/vless_server.py"
 import http.server
 import socketserver
-import ssl
-import os
 import urllib.parse
 import socket
 
 PORT = $sub_port
 SUB_UUID = "$sub_uuid"
-CERT_FILE = "$web_dir/certs/cert.pem"
-KEY_FILE = "$web_dir/certs/key.pem"
 
 try:
     with open("$web_dir/$sub_uuid/clash-meta-sub.yaml", 'rb') as f:
@@ -530,13 +533,6 @@ try:
 except OSError:
     DualStackServer.address_family = socket.AF_INET
     httpd = DualStackServer(("0.0.0.0", PORT), SecureSubHandler)
-
-try:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-except AttributeError:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS)
-context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
-httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
 httpd.serve_forever()
 EOF
@@ -630,11 +626,20 @@ EOF
     svc_start sing-box
     generate_client_configs
     
-    sleep 2
+    # 修复：引入轮询检测机制，避免系统慢导致端口误判失败
     local port=$(cat /usr/local/etc/sing-box/port.txt)
-    if ! ss -tnl | grep -E -q ":$port( |$)"; then
+    local start_success=0
+    for i in {1..10}; do
+        if ss -tnl | grep -E -q ":$port( |$)"; then
+            start_success=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ $start_success -eq 0 ]]; then
         echo ""
-        red " [致命错误] 服务端未能成功启动，端口 $port 未被监听！"
+        red " [致命错误] 服务端未能成功启动，端口 $port 未被监听！请检查日志。"
         exit 1
     fi
     
@@ -670,11 +675,12 @@ showconf() {
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.txt)
     local sub_path=$(cat /usr/local/etc/sing-box/sub_path.txt)
     
+    # 修复：订阅链接改为纯 http，搭配随机 UUID 路径足够安全，同时兼容所有客户端
     local sub_url=""
     if [[ "$ip" == *":"* ]]; then
-        sub_url="https://[${ip}]:${sub_port}/${sub_path}"
+        sub_url="http://[${ip}]:${sub_port}/${sub_path}"
     else
-        sub_url="https://${ip}:${sub_port}/${sub_path}"
+        sub_url="http://${ip}:${sub_port}/${sub_path}"
     fi
 
     local web_dir="/var/www/vless"
@@ -690,7 +696,6 @@ showconf() {
     yellow "  ▶ [智能订阅链接] (推荐)"
     purple "    适用客户端: Clash Meta / Verge / v2rayN / Shadowrocket"
     green  "    订阅地址: ${sub_url}"
-    yellow "    (注：若客户端提示证书不受信任，请选择允许/跳过验证)"
     echo ""
     yellow "  ▶ [单节点直连链接]"
     purple "    适用客户端: NekoBox / v2rayNG (直接导入)"
@@ -736,7 +741,6 @@ edit_config() {
     echo -en " ${LIGHT_YELLOW} ▶ 是否需要修改配置文件？(y/n) [默认: n]: ${PLAIN}"
     read edit_choice
     
-    # 增加语法防抖校验及配置核心数据同步
     if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
         cp /usr/local/etc/sing-box/config.json /tmp/config_backup.json
         
@@ -770,7 +774,6 @@ edit_config() {
                 green "  重启成功！新配置已生效。"
                 yellow "  正在同步更新客户端订阅文件..."
                 
-                # 同步所有可能被修改的关键数据
                 local new_uuid=$(jq -r '.inbounds[0].users[0].uuid' /usr/local/etc/sing-box/config.json)
                 local new_port=$(jq -r '.inbounds[0].listen_port' /usr/local/etc/sing-box/config.json)
                 local new_sni=$(jq -r '.inbounds[0].tls.server_name' /usr/local/etc/sing-box/config.json)
@@ -813,17 +816,20 @@ modify_sni() {
     read new_sni
     
     if [[ -n "$new_sni" && "$new_sni" != "$old_sni" ]]; then
-        # [已修复] 适配 sing-box v1.13+ 最新版本的 jq 语法修改逻辑
-        jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' /usr/local/etc/sing-box/config.json > /tmp/sb_tmp.json
-        mv -f /tmp/sb_tmp.json /usr/local/etc/sing-box/config.json
-        echo "$new_sni" > /usr/local/etc/sing-box/sni.txt
-        
-        green "  已更新 SNI 为 $new_sni"
-        green "  正在重启服务并更新订阅信息..."
-        svc_stop sing-box
-        svc_start sing-box
-        generate_client_configs
-        green "  更新完成！请在客户端更新订阅以应用新 SNI。"
+        # 修复：防掉盘机制，确保 jq 执行成功且文件不为空时再覆盖
+        if jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' /usr/local/etc/sing-box/config.json > /tmp/sb_tmp.json && [ -s /tmp/sb_tmp.json ]; then
+            mv -f /tmp/sb_tmp.json /usr/local/etc/sing-box/config.json
+            echo "$new_sni" > /usr/local/etc/sing-box/sni.txt
+            
+            green "  已更新 SNI 为 $new_sni"
+            green "  正在重启服务并更新订阅信息..."
+            svc_stop sing-box
+            svc_start sing-box
+            generate_client_configs
+            green "  更新完成！请在客户端更新订阅以应用新 SNI。"
+        else
+            red "  [错误] 配置文件解析失败，SNI 未修改！"
+        fi
     else
         yellow "  操作已取消或未更改。"
     fi
@@ -842,7 +848,6 @@ check_logs() {
     if [[ $SYSTEM == "Alpine" ]]; then
         red "  Alpine 暂不提供 systemd 日志查看功能。"
     else
-        # 增加 -f 参数进行持续监听，避免闪退
         yellow "  正在实时滚动日志 (按 Ctrl+C 退出查看)..."
         echo ""
         journalctl -u sing-box -f -n 30
@@ -912,7 +917,6 @@ net.core.wmem_default=26214400
 net.core.somaxconn=65535
 net.ipv4.tcp_fastopen=3
 EOF
-    # sysctl -p 回退指令中指定完整的文件路径
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
     
     echo ""
