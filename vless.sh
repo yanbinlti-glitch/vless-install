@@ -170,14 +170,14 @@ check_env() {
         
         [[ ! $SYSTEM == "CentOS" ]] && { $PKG_UPDATE || { echo ""; red " [错误] 系统软件源更新失败！请检查网络。"; exit 1; }; }
         
+        # [修复] 补充 gcompat libc6-compat 解决 Alpine 下的 c 运行库缺失问题
         if [[ $SYSTEM == "Alpine" ]]; then
-            $PKG_INSTALL curl wget sudo procps iptables ip6tables iproute2 python3 openssl libqrencode-tools tar gzip jq || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
+            $PKG_INSTALL curl wget sudo procps iptables ip6tables iproute2 python3 openssl libqrencode-tools tar gzip jq gcompat libc6-compat || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
         elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
             $PKG_INSTALL epel-release || true
             $PKG_INSTALL curl wget sudo procps iptables iptables-services iproute python3 openssl qrencode tar gzip jq || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
         else
             apt-get --fix-broken install -y || true
-            # [修复] 预设 debconf 选择，防止 apt 安装 iptables-persistent 时卡在图形界面
             echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
             echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
             $PKG_INSTALL curl wget sudo procps iptables-persistent netfilter-persistent iproute2 python3 openssl qrencode tar gzip jq || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
@@ -190,6 +190,12 @@ check_env() {
         print_line
         green "  所有前置依赖检查通过，环境完美，无需额外安装！"
     fi
+    
+    # 再次强校验 Alpine 系统的 glibc 兼容层，防止老旧系统漏装
+    if [[ $SYSTEM == "Alpine" ]] && ! command -v ldd >/dev/null 2>&1; then
+        $PKG_INSTALL gcompat libc6-compat >/dev/null 2>&1
+    fi
+
     sleep 2
 }
 
@@ -208,7 +214,6 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
-    # [修复] 放弃直接请求 api.github.com，通过重定向抓取规避 rate limit 限制
     sb_version=$(curl -Ls -o /dev/null -w %{url_effective} https://github.com/SagerNet/sing-box/releases/latest | awk -F'/' '{print $NF}' | sed 's/^v//')
     [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败，请检查网络！" && exit 1
     
@@ -329,7 +334,6 @@ EOF
 inst_sub_port(){
     echo ""
     print_line
-    # [修复] 修正提示文案与代码逻辑不符的问题
     echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [10000-65535] (回车随机): ${PLAIN}"
     read sub_port_input
     [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-65535 -n 1)
@@ -582,7 +586,6 @@ rc_ulimit="-n 1048576"
 EOF
         chmod +x /etc/init.d/sing-box
     else
-        # [修复] 清理掉没有意义的提权参数 (因为进程本身跑在 root 下)，保持干净规范
         cat << EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box Service
@@ -734,12 +737,10 @@ edit_config() {
             systemctl is-active --quiet sing-box && restart_success=1
         fi
         
-        # [修复] 如果修改配置后重启成功，强制刷新订阅文件，避免数据脱节
         if [[ $restart_success -eq 1 ]]; then
             green "  重启成功！新配置已生效。"
             yellow "  正在同步更新客户端订阅文件..."
             
-            # 重新提取关键信息用于下发订阅
             local new_uuid=$(jq -r '.inbounds[0].users[0].uuid' /usr/local/etc/sing-box/config.json)
             local new_port=$(jq -r '.inbounds[0].listen_port' /usr/local/etc/sing-box/config.json)
             echo "$new_uuid" > /usr/local/etc/sing-box/uuid.txt
