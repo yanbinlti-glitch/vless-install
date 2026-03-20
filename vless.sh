@@ -137,7 +137,7 @@ close_port() {
 }
 
 # =================================================================
-#  4. 环境检查与预处理
+#  4. 环境检查与预处理 (包含 Alpine 底层库修复)
 # =================================================================
 check_env() {
     clear
@@ -190,8 +190,17 @@ check_env() {
         green "  所有前置依赖检查通过，环境完美，无需额外安装！"
     fi
     
-    if [[ $SYSTEM == "Alpine" ]] && ! command -v ldd >/dev/null 2>&1; then
+    # 强制修复 Alpine 的 glibc 兼容层，解决 sing-box 无法执行的问题
+    if [[ $SYSTEM == "Alpine" ]]; then
+        yellow "  正在为 Alpine 系统校验底层 glibc 兼容环境..."
         $PKG_INSTALL gcompat libc6-compat >/dev/null 2>&1
+        
+        # 建立动态链接库软链接
+        mkdir -p /lib64
+        if [[ ! -f /lib64/ld-linux-x86-64.so.2 ]]; then
+            ln -s /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2 2>/dev/null
+        fi
+        green "   [✔] Alpine 兼容层校验通过！"
     fi
 
     sleep 2
@@ -238,7 +247,7 @@ inst_config() {
     
     echo ""
     print_line
-    # [修复] 强制限制主端口只能为 10000-65535 的纯数字，防止 iptables 越权或报错
+    # 强制限制主端口只能为 10000-65535 的纯数字
     while true; do
         echo -en " ${LIGHT_YELLOW} ▶ 设置节点主端口 [10000-65535] (回车随机): ${PLAIN}"
         read port
@@ -337,7 +346,7 @@ EOF
 inst_sub_port(){
     echo ""
     print_line
-    # [修复] 强制限制订阅端口只能为 10000-65535 的纯数字，防止 nobody 用户启动 Python 失败
+    # 强制限制订阅端口只能为 10000-65535 的纯数字
     while true; do
         echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [10000-65535] (回车随机): ${PLAIN}"
         read sub_port_input
@@ -449,7 +458,6 @@ rules:
   - MATCH,节点选择
 EOF
 
-    # [优化] 限制静态文件的权限，防止 nobody 被提权或误操作
     chmod 644 "$web_dir/$sub_uuid/clash-meta-sub.yaml"
     chmod 644 "$web_dir/$sub_uuid/sub_b64.txt"
 
@@ -728,7 +736,7 @@ edit_config() {
     echo -en " ${LIGHT_YELLOW} ▶ 是否需要修改配置文件？(y/n) [默认: n]: ${PLAIN}"
     read edit_choice
     
-    # [修复] 增加语法防抖校验及配置核心数据同步
+    # 增加语法防抖校验及配置核心数据同步
     if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
         cp /usr/local/etc/sing-box/config.json /tmp/config_backup.json
         
@@ -833,7 +841,7 @@ check_logs() {
     if [[ $SYSTEM == "Alpine" ]]; then
         red "  Alpine 暂不提供 systemd 日志查看功能。"
     else
-        # [修复] 增加 -f 参数进行持续监听，避免闪退
+        # 增加 -f 参数进行持续监听，避免闪退
         yellow "  正在实时滚动日志 (按 Ctrl+C 退出查看)..."
         echo ""
         journalctl -u sing-box -f -n 30
@@ -903,7 +911,7 @@ net.core.wmem_default=26214400
 net.core.somaxconn=65535
 net.ipv4.tcp_fastopen=3
 EOF
-    # [修复] sysctl -p 回退指令中指定完整的文件路径
+    # sysctl -p 回退指令中指定完整的文件路径
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
     
     echo ""
