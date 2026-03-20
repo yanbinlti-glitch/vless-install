@@ -177,6 +177,9 @@ check_env() {
             $PKG_INSTALL curl wget sudo procps iptables iptables-services iproute python3 openssl qrencode tar gzip jq || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
         else
             apt-get --fix-broken install -y || true
+            # [修复] 预设 debconf 选择，防止 apt 安装 iptables-persistent 时卡在图形界面
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
             $PKG_INSTALL curl wget sudo procps iptables-persistent netfilter-persistent iproute2 python3 openssl qrencode tar gzip jq || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
         fi
         
@@ -205,7 +208,8 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
-    sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    # [修复] 放弃直接请求 api.github.com，通过重定向抓取规避 rate limit 限制
+    sb_version=$(curl -Ls -o /dev/null -w %{url_effective} https://github.com/SagerNet/sing-box/releases/latest | awk -F'/' '{print $NF}' | sed 's/^v//')
     [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败，请检查网络！" && exit 1
     
     green "  获取到最新版本: v${sb_version}"
@@ -325,15 +329,16 @@ EOF
 inst_sub_port(){
     echo ""
     print_line
-    echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [1024-65535] (回车随机): ${PLAIN}"
+    # [修复] 修正提示文案与代码逻辑不符的问题
+    echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [10000-65535] (回车随机): ${PLAIN}"
     read sub_port_input
-    [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-30000 -n 1)
+    [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-65535 -n 1)
     
     while ss -tnl | grep -E -q ":$sub_port_input( |$)"; do
         red " [警告] 端口 $sub_port_input 已被占用！"
         echo -en " ${LIGHT_YELLOW} ▶ 重新设置订阅端口: ${PLAIN}"
         read sub_port_input
-        [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-30000 -n 1)
+        [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-65535 -n 1)
     done
     green " 订阅端口已设置为: $sub_port_input"
     open_port $sub_port_input
@@ -577,6 +582,7 @@ rc_ulimit="-n 1048576"
 EOF
         chmod +x /etc/init.d/sing-box
     else
+        # [修复] 清理掉没有意义的提权参数 (因为进程本身跑在 root 下)，保持干净规范
         cat << EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box Service
@@ -585,8 +591,6 @@ After=network.target nss-lookup.target
 
 [Service]
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
 Restart=on-failure
@@ -723,10 +727,28 @@ edit_config() {
         svc_start sing-box
         sleep 1
         
+        local restart_success=0
         if [[ $SYSTEM == "Alpine" ]]; then
-            rc-service sing-box status | grep -q 'started' && green "  重启成功！新配置已生效。" || red "  [错误] 启动失败！检查 JSON 格式。"
+            rc-service sing-box status | grep -q 'started' && restart_success=1
         else
-            systemctl is-active --quiet sing-box && green "  重启成功！新配置已生效。" || red "  [错误] 启动失败！检查 JSON 格式。"
+            systemctl is-active --quiet sing-box && restart_success=1
+        fi
+        
+        # [修复] 如果修改配置后重启成功，强制刷新订阅文件，避免数据脱节
+        if [[ $restart_success -eq 1 ]]; then
+            green "  重启成功！新配置已生效。"
+            yellow "  正在同步更新客户端订阅文件..."
+            
+            # 重新提取关键信息用于下发订阅
+            local new_uuid=$(jq -r '.inbounds[0].users[0].uuid' /usr/local/etc/sing-box/config.json)
+            local new_port=$(jq -r '.inbounds[0].listen_port' /usr/local/etc/sing-box/config.json)
+            echo "$new_uuid" > /usr/local/etc/sing-box/uuid.txt
+            echo "$new_port" > /usr/local/etc/sing-box/port.txt
+            
+            generate_client_configs
+            green "  客户端订阅文件已同步更新！"
+        else
+            red "  [错误] 启动失败！检查 JSON 格式。"
         fi
     fi
     echo ""
