@@ -280,7 +280,7 @@ inst_config() {
     echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 设置 Reality 伪装域名 (SNI) [回车默认 www.microsoft.com]: ${PLAIN}"
     read dest_sni
-    [[ -z $dest_sni ]] && dest_sni="www.microsoft.com"
+    [[ -z $dest_sni ]] && dest_sni="www.bing.com"
     green " 伪装域名设置为: $dest_sni"
 
     echo ""
