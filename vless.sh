@@ -289,6 +289,7 @@ inst_config() {
     green "  ✔ x25519 密钥对生成成功!"
     green "  ✔ shortId 生成成功!"
 
+    # [已修复] 适配 sing-box v1.13+ 最新版本的 Reality Handshake 语法格式
     cat << EOF > /usr/local/etc/sing-box/config.json
 {
   "log": {
@@ -299,7 +300,7 @@ inst_config() {
     {
       "type": "vless",
       "tag": "vless-in",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": $port,
       "users": [
         {
@@ -313,9 +314,8 @@ inst_config() {
         "reality": {
           "enabled": true,
           "handshake": {
-            "server_options": {
-              "server_name": "$dest_sni"
-            }
+            "server": "$dest_sni",
+            "server_port": 443
           },
           "private_key": "$private_key",
           "short_id": [
@@ -813,7 +813,8 @@ modify_sni() {
     read new_sni
     
     if [[ -n "$new_sni" && "$new_sni" != "$old_sni" ]]; then
-        jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server_options.server_name = $sni' /usr/local/etc/sing-box/config.json > /tmp/sb_tmp.json
+        # [已修复] 适配 sing-box v1.13+ 最新版本的 jq 语法修改逻辑
+        jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' /usr/local/etc/sing-box/config.json > /tmp/sb_tmp.json
         mv -f /tmp/sb_tmp.json /usr/local/etc/sing-box/config.json
         echo "$new_sni" > /usr/local/etc/sing-box/sni.txt
         
