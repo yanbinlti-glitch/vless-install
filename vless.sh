@@ -81,7 +81,6 @@ gen_random_str() {
     echo "${str:0:$len}"
 }
 
-# 优化：智能匹配系统防火墙
 open_port() {
     local port=$1
     if command -v ufw >/dev/null && ufw status | grep -qw active; then
@@ -160,7 +159,6 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
-    # 规避 Github API 限流
     local sb_version=$(curl -Ls -o /dev/null -w %{url_effective} "https://github.com/SagerNet/sing-box/releases/latest" | grep -oP 'tag/v?\K.*')
     [[ -z "$sb_version" ]] && sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
     [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败！" && exit 1
@@ -181,12 +179,30 @@ inst_singbox_core() {
 }
 
 # =================================================================
-#  4. 多模式信息收集系统
+#  4. 多模式信息收集系统 (加入订阅端口手动配置)
 # =================================================================
 collect_base_info() {
     echo -en " ${LIGHT_YELLOW} ▶ 节点显示名称 [回车默认 VLESS_Node]: ${PLAIN}"
     read NODE_NAME
     [[ -z $NODE_NAME ]] && NODE_NAME="VLESS_Node"
+
+    while true; do
+        echo -en " ${LIGHT_YELLOW} ▶ 设置订阅服务端口 [1000-65535] (回车随机): ${PLAIN}"
+        read SUB_PORT_INPUT
+        if [[ -z $SUB_PORT_INPUT ]]; then
+            SUB_PORT=$(shuf -i 10000-65535 -n 1)
+            break
+        elif [[ "$SUB_PORT_INPUT" =~ ^[0-9]+$ ]] && [ "$SUB_PORT_INPUT" -ge 1000 ] && [ "$SUB_PORT_INPUT" -le 65535 ]; then
+            if ss -tnl | grep -E -q ":$SUB_PORT_INPUT( |$)"; then
+                red " [警告] 该端口已被占用，请重新输入！"
+            else
+                SUB_PORT=$SUB_PORT_INPUT
+                break
+            fi
+        else
+            red " [错误] 请输入有效的端口号 (1000-65535)！"
+        fi
+    done
 }
 
 collect_reality_info() {
@@ -323,7 +339,7 @@ EOF
     echo "$json_content" > /usr/local/etc/sing-box/config.json
     chmod 600 /usr/local/etc/sing-box/config.json
     echo "$NODE_NAME" > /usr/local/etc/sing-box/node_name.meta
-    SUB_PORT=$(shuf -i 10000-65535 -n 1)
+    
     echo "$SUB_PORT" > /usr/local/etc/sing-box/sub_port.meta
     open_port $NODE_PORT; open_port $SUB_PORT
 }
@@ -640,13 +656,61 @@ showconf() {
     echo ""; print_line; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
-check_logs() {
-    clear; echo ""; print_line; green "                  sing-box 实时运行日志                    "; print_line; echo ""
-    if [[ $SYSTEM == "Alpine" ]]; then red "  Alpine 暂不支持 journalctl 查看。"; else
-        yellow "  正在实时滚动日志 (按 Ctrl+C 退出查看)..."; echo ""
-        journalctl -u sing-box -f -n 30
+# =================================================================
+#  新增：配置中转落地 (链式代理 Outbound)
+# =================================================================
+setup_chain_outbound() {
+    clear; echo ""; print_line; green "                  配置中转落地 (链式代理 Outbound)                  "; print_line; echo ""
+    local cfg="/usr/local/etc/sing-box/config.json"
+    if [[ ! -f $cfg ]]; then red "  未检测到配置，请先安装服务！"; sleep 2; return; fi
+
+    echo -e "  当前出站规则将转发您的所有流量，可选以下协议连接至落地节点："
+    echo ""
+    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}Socks5 落地${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_YELLOW}Shadowsocks 落地${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}Trojan 落地${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}恢复直连 (撤销中转，恢复 Direct)${PLAIN}"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请选择落地协议 [0-3]: ${PLAIN}"; read out_type
+
+    if [[ "$out_type" == "0" ]]; then
+        jq '.outbounds = [{ "type": "direct", "tag": "direct" }]' $cfg > /tmp/sb_tmp.json
+        mv /tmp/sb_tmp.json $cfg
+        systemctl restart sing-box
+        green "  已撤销中转节点，恢复为直连模式！"; sleep 2; return
     fi
-    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
+
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入落地节点 IP/域名: ${PLAIN}"; read out_ip
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入落地节点 端口: ${PLAIN}"; read out_port
+
+    if [[ "$out_type" == "1" ]]; then
+        echo -en " ${LIGHT_YELLOW} ▶ Socks5 用户名 (若无请留空直接回车): ${PLAIN}"; read out_user
+        echo -en " ${LIGHT_YELLOW} ▶ Socks5 密码 (若无请留空直接回车): ${PLAIN}"; read out_pass
+        if [[ -n "$out_user" ]]; then
+            jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+        else
+            jq --arg ip "$out_ip" --arg port "$out_port" '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+        fi
+    elif [[ "$out_type" == "2" ]]; then
+        echo -en " ${LIGHT_YELLOW} ▶ 加密方式 (如 aes-256-gcm): ${PLAIN}"; read out_method
+        echo -en " ${LIGHT_YELLOW} ▶ 密码: ${PLAIN}"; read out_pass
+        jq --arg ip "$out_ip" --arg port "$out_port" --arg method "$out_method" --arg pass "$out_pass" '.outbounds = [{ "type": "shadowsocks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "method": $method, "password": $pass }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+    elif [[ "$out_type" == "3" ]]; then
+        echo -en " ${LIGHT_YELLOW} ▶ 密码: ${PLAIN}"; read out_pass
+        echo -en " ${LIGHT_YELLOW} ▶ SNI 伪装域名 (若无请留空，默认使用IP): ${PLAIN}"; read out_sni
+        [[ -z "$out_sni" ]] && out_sni="$out_ip"
+        jq --arg ip "$out_ip" --arg port "$out_port" --arg pass "$out_pass" --arg sni "$out_sni" '.outbounds = [{ "type": "trojan", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "password": $pass, "tls": {"enabled": true, "server_name": $sni} }, {"type":"direct", "tag":"direct"}]' $cfg > /tmp/sb_tmp.json
+    else
+        red "  无效的选择！操作取消。"; sleep 2; return
+    fi
+
+    if [ -s /tmp/sb_tmp.json ]; then
+        mv -f /tmp/sb_tmp.json $cfg
+        systemctl restart sing-box
+        green "  [✔] 中转落地配置完成，sing-box 服务已成功重启并接管流量！"; sleep 3
+    else
+        red "  [错误] 配置文件解析或写入失败！"; sleep 2
+    fi
 }
 
 enable_bbr() {
@@ -683,7 +747,7 @@ check_keys() {
 }
 
 # =================================================================
-#  7. 交互主菜单 (保留原版 UI 框架)
+#  7. 交互主菜单 (保留原版 UI 框架，更替选项 [7])
 # =================================================================
 menu() {
     clear
@@ -708,7 +772,7 @@ menu() {
     echo -e "  ${LIGHT_GREEN}[5]${PLAIN} ${LIGHT_GREEN}修改 伪装域名 (SNI / 真实域名)${PLAIN}"
     echo "----------------------------------------------------------------------------------"
     echo -e "  ${LIGHT_GREEN}[6]${PLAIN} ${LIGHT_GREEN}获取 节点配置 与 订阅链接${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[7]${PLAIN} ${LIGHT_YELLOW}查看 sing-box 实时运行日志${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[7]${PLAIN} ${LIGHT_YELLOW}配置 中转落地 (链式代理 Outbound)${PLAIN}"
     echo -e "  ${LIGHT_GREEN}[8]${PLAIN} ${LIGHT_PURPLE}开启 BBR 拥塞控制调优 (强烈推荐)${PLAIN}"
     echo -e "  ${LIGHT_GREEN}[9]${PLAIN} ${LIGHT_GREEN}检查 核心安全密钥与参数状态${PLAIN}"
     echo "----------------------------------------------------------------------------------"
@@ -724,7 +788,7 @@ menu() {
         4 ) edit_config ;;
         5 ) modify_sni ;;
         6 ) showconf ;;
-        7 ) check_logs ;;
+        7 ) setup_chain_outbound ;;
         8 ) enable_bbr ;;
         9 ) check_keys ;;
         0 ) exit 0 ;;
