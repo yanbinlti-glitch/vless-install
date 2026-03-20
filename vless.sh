@@ -170,7 +170,6 @@ check_env() {
         
         [[ ! $SYSTEM == "CentOS" ]] && { $PKG_UPDATE || { echo ""; red " [错误] 系统软件源更新失败！请检查网络。"; exit 1; }; }
         
-        # [修复] 补充 gcompat libc6-compat 解决 Alpine 下的 c 运行库缺失问题
         if [[ $SYSTEM == "Alpine" ]]; then
             $PKG_INSTALL curl wget sudo procps iptables ip6tables iproute2 python3 openssl libqrencode-tools tar gzip jq gcompat libc6-compat || { echo ""; red " [错误] 依赖安装失败！"; exit 1; }
         elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
@@ -191,7 +190,6 @@ check_env() {
         green "  所有前置依赖检查通过，环境完美，无需额外安装！"
     fi
     
-    # 再次强校验 Alpine 系统的 glibc 兼容层，防止老旧系统漏装
     if [[ $SYSTEM == "Alpine" ]] && ! command -v ldd >/dev/null 2>&1; then
         $PKG_INSTALL gcompat libc6-compat >/dev/null 2>&1
     fi
@@ -240,15 +238,20 @@ inst_config() {
     
     echo ""
     print_line
-    echo -en " ${LIGHT_YELLOW} ▶ 设置节点主端口 [10000-65535] (回车随机): ${PLAIN}"
-    read port
-    [[ -z $port ]] && port=$(shuf -i 10000-65535 -n 1)
-    
-    while ss -tnl | grep -E -q ":$port( |$)"; do
-        red " [警告] 端口 $port 已被占用！"
-        echo -en " ${LIGHT_YELLOW} ▶ 重新设置主端口: ${PLAIN}"
+    # [修复] 强制限制主端口只能为 10000-65535 的纯数字，防止 iptables 越权或报错
+    while true; do
+        echo -en " ${LIGHT_YELLOW} ▶ 设置节点主端口 [10000-65535] (回车随机): ${PLAIN}"
         read port
         [[ -z $port ]] && port=$(shuf -i 10000-65535 -n 1)
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 10000 ] && [ "$port" -le 65535 ]; then
+            if ss -tnl | grep -E -q ":$port( |$)"; then
+                red " [警告] 端口 $port 已被占用！"
+            else
+                break
+            fi
+        else
+            red " [错误] 格式无效或包含特权端口！请输入 10000-65535 之间的纯数字。"
+        fi
     done
     green " 节点主端口已设置为: $port (TCP)"
     open_port $port
@@ -334,15 +337,20 @@ EOF
 inst_sub_port(){
     echo ""
     print_line
-    echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [10000-65535] (回车随机): ${PLAIN}"
-    read sub_port_input
-    [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-65535 -n 1)
-    
-    while ss -tnl | grep -E -q ":$sub_port_input( |$)"; do
-        red " [警告] 端口 $sub_port_input 已被占用！"
-        echo -en " ${LIGHT_YELLOW} ▶ 重新设置订阅端口: ${PLAIN}"
+    # [修复] 强制限制订阅端口只能为 10000-65535 的纯数字，防止 nobody 用户启动 Python 失败
+    while true; do
+        echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [10000-65535] (回车随机): ${PLAIN}"
         read sub_port_input
         [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-65535 -n 1)
+        if [[ "$sub_port_input" =~ ^[0-9]+$ ]] && [ "$sub_port_input" -ge 10000 ] && [ "$sub_port_input" -le 65535 ]; then
+            if ss -tnl | grep -E -q ":$sub_port_input( |$)"; then
+                red " [警告] 端口 $sub_port_input 已被占用！"
+            else
+                break
+            fi
+        else
+            red " [错误] 格式无效或包含特权端口！请输入 10000-65535 之间的纯数字。"
+        fi
     done
     green " 订阅端口已设置为: $sub_port_input"
     open_port $sub_port_input
@@ -441,9 +449,12 @@ rules:
   - MATCH,节点选择
 EOF
 
+    # [优化] 限制静态文件的权限，防止 nobody 被提权或误操作
+    chmod 644 "$web_dir/$sub_uuid/clash-meta-sub.yaml"
+    chmod 644 "$web_dir/$sub_uuid/sub_b64.txt"
+
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.txt)
     
-    # 为 Python 服务器生成一个自签证书以开启 HTTPS
     if [[ ! -f "$web_dir/certs/cert.pem" ]]; then
         openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -subj "/C=US/ST=CA/L=LA/O=VLESS/CN=sub.server" -keyout "$web_dir/certs/key.pem" -out "$web_dir/certs/cert.pem" 2>/dev/null
     fi
@@ -716,7 +727,11 @@ edit_config() {
     print_line
     echo -en " ${LIGHT_YELLOW} ▶ 是否需要修改配置文件？(y/n) [默认: n]: ${PLAIN}"
     read edit_choice
+    
+    # [修复] 增加语法防抖校验及配置核心数据同步
     if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
+        cp /usr/local/etc/sing-box/config.json /tmp/config_backup.json
+        
         if command -v nano >/dev/null; then
             nano /usr/local/etc/sing-box/config.json
         elif command -v vi >/dev/null; then
@@ -725,31 +740,45 @@ edit_config() {
             red "  未找到 nano 或 vi，请手动修改 /usr/local/etc/sing-box/config.json"
         fi
         
-        green "  正在重启 sing-box 服务验证配置..."
-        svc_stop sing-box
-        svc_start sing-box
-        sleep 1
-        
-        local restart_success=0
-        if [[ $SYSTEM == "Alpine" ]]; then
-            rc-service sing-box status | grep -q 'started' && restart_success=1
+        yellow "  正在校验配置文件语法..."
+        if ! /usr/local/bin/sing-box check -c /usr/local/etc/sing-box/config.json >/dev/null 2>&1; then
+            red "  [错误] 检测到 JSON 语法错误！已为您自动回滚到修改前的配置。"
+            mv /tmp/config_backup.json /usr/local/etc/sing-box/config.json
         else
-            systemctl is-active --quiet sing-box && restart_success=1
-        fi
-        
-        if [[ $restart_success -eq 1 ]]; then
-            green "  重启成功！新配置已生效。"
-            yellow "  正在同步更新客户端订阅文件..."
+            green "  语法校验通过，正在重启服务..."
+            rm -f /tmp/config_backup.json
+            svc_stop sing-box
+            svc_start sing-box
+            sleep 1
             
-            local new_uuid=$(jq -r '.inbounds[0].users[0].uuid' /usr/local/etc/sing-box/config.json)
-            local new_port=$(jq -r '.inbounds[0].listen_port' /usr/local/etc/sing-box/config.json)
-            echo "$new_uuid" > /usr/local/etc/sing-box/uuid.txt
-            echo "$new_port" > /usr/local/etc/sing-box/port.txt
+            local restart_success=0
+            if [[ $SYSTEM == "Alpine" ]]; then
+                rc-service sing-box status | grep -q 'started' && restart_success=1
+            else
+                systemctl is-active --quiet sing-box && restart_success=1
+            fi
             
-            generate_client_configs
-            green "  客户端订阅文件已同步更新！"
-        else
-            red "  [错误] 启动失败！检查 JSON 格式。"
+            if [[ $restart_success -eq 1 ]]; then
+                green "  重启成功！新配置已生效。"
+                yellow "  正在同步更新客户端订阅文件..."
+                
+                # 同步所有可能被修改的关键数据
+                local new_uuid=$(jq -r '.inbounds[0].users[0].uuid' /usr/local/etc/sing-box/config.json)
+                local new_port=$(jq -r '.inbounds[0].listen_port' /usr/local/etc/sing-box/config.json)
+                local new_sni=$(jq -r '.inbounds[0].tls.server_name' /usr/local/etc/sing-box/config.json)
+                local new_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /usr/local/etc/sing-box/config.json)
+                
+                echo "$new_uuid" > /usr/local/etc/sing-box/uuid.txt
+                echo "$new_port" > /usr/local/etc/sing-box/port.txt
+                echo "$new_sni" > /usr/local/etc/sing-box/sni.txt
+                echo "$new_sid" > /usr/local/etc/sing-box/sid.txt
+                
+                generate_client_configs
+                green "  客户端订阅文件已同步更新！"
+                purple "  (提示：如果您修改了 Private Key，由于无法反推公钥，请勿忘记手动给客户端更换公钥！)"
+            else
+                red "  [错误] 启动失败！请通过主菜单日志检查原因。"
+            fi
         fi
     fi
     echo ""
@@ -804,7 +833,10 @@ check_logs() {
     if [[ $SYSTEM == "Alpine" ]]; then
         red "  Alpine 暂不提供 systemd 日志查看功能。"
     else
-        journalctl -u sing-box --no-pager -n 30
+        # [修复] 增加 -f 参数进行持续监听，避免闪退
+        yellow "  正在实时滚动日志 (按 Ctrl+C 退出查看)..."
+        echo ""
+        journalctl -u sing-box -f -n 30
     fi
     echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
@@ -871,7 +903,8 @@ net.core.wmem_default=26214400
 net.core.somaxconn=65535
 net.ipv4.tcp_fastopen=3
 EOF
-    sysctl --system >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1
+    # [修复] sysctl -p 回退指令中指定完整的文件路径
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
     
     echo ""
     green "  BBR 拥塞控制与 TCP 底层调优开启成功！"
