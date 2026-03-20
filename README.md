@@ -37,4 +37,4 @@
 请使用 `root` 用户登录你的 VPS，然后复制并运行以下命令即可一键安装部署：
 
 ```bash
-wget -N --no-check-certificate https://raw.githubusercontent.com/yanbinlti-glitch/vless-install/main/vless.sh && bash vless.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/yanbinlti-glitch/vless-install/main/vless.sh && sed -i 's/\r$//' vless.sh && bash vless.sh
