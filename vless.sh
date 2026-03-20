@@ -589,9 +589,9 @@ proxy_switch() {
     echo ""; echo -e "    ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_PURPLE}返回主菜单${PLAIN}"; echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [0-3]: ${PLAIN}"; read switchInput
     case $switchInput in
-        1) systemctl start sing-box vless-sub >/dev/null 2>&1; green "  启动成功"; sleep 1 ;;
-        2) systemctl stop sing-box vless-sub >/dev/null 2>&1; pkill -f "vless_server.py" 2>/dev/null; yellow "  已停止"; sleep 1 ;;
-        3) systemctl restart sing-box vless-sub >/dev/null 2>&1; green "  重启成功"; sleep 1 ;;
+        1) if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box start >/dev/null 2>&1; rc-service vless-sub start >/dev/null 2>&1; else systemctl start sing-box vless-sub >/dev/null 2>&1; fi; green "  启动成功"; sleep 1 ;;
+        2) if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box stop >/dev/null 2>&1; rc-service vless-sub stop >/dev/null 2>&1; else systemctl stop sing-box vless-sub >/dev/null 2>&1; fi; pkill -f "vless_server.py" 2>/dev/null; yellow "  已停止"; sleep 1 ;;
+        3) if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; rc-service vless-sub restart >/dev/null 2>&1; else systemctl restart sing-box vless-sub >/dev/null 2>&1; fi; green "  重启成功"; sleep 1 ;;
         0) return ;;
         *) red "  输入无效"; sleep 1 ;;
     esac
@@ -611,7 +611,8 @@ edit_config() {
             red "  [错误] 语法错误！已回滚配置。"; mv /tmp/config_backup.json $cfg
         else
             green "  语法通过，正在重启同步..."; rm -f /tmp/config_backup.json
-            systemctl restart sing-box; generate_client_configs
+            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
+            generate_client_configs
             green "  重启同步完成！"
         fi
     fi
@@ -635,7 +636,8 @@ modify_sni() {
         if [ -s /tmp/sb_tmp.json ]; then
             mv -f /tmp/sb_tmp.json $cfg
             green "  已更新域名为 $new_sni，正在重启并同步订阅..."
-            systemctl restart sing-box; generate_client_configs
+            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
+            generate_client_configs
             green "  更新完成！"
         else
             red "  [错误] 配置文件解析失败！"
@@ -663,7 +665,7 @@ showconf() {
 }
 
 # =================================================================
-#  静态住宅 IP 专属落地配置 (已修复 Vision 冲突及强制路由)
+#  静态住宅 IP 专属落地配置 (修复 443 端口 HTTPS 代理支持 + Alpine兼容)
 # =================================================================
 setup_chain_outbound() {
     clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
@@ -682,15 +684,15 @@ setup_chain_outbound() {
     echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 请选择代理协议 [0-3]: ${PLAIN}"; read out_type
 
-    # 0. 恢复直连 (并智能恢复 Vision 流控)
+    # 0. 恢复直连
     if [[ "$out_type" == "0" ]]; then
         jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
         if [ -s "$tmp_cfg" ]; then
             mv -f "$tmp_cfg" "$cfg"
-            systemctl restart sing-box
+            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
             generate_client_configs
             green "  [✔] 已撤销住宅 IP 落地，恢复为 VPS 全局直连模式 (已重新开启 Vision 加速)！"
-            purple "  💡 重要提示：节点配置参数已自动更新，请务必在客户端【更新一次订阅】！"
+            purple "  💡 重要提示：节点配置已变，请在客户端【更新订阅】！"
             sleep 3; return
         else
             red "  [✘] 配置文件修改失败！"; sleep 2; return
@@ -701,6 +703,7 @@ setup_chain_outbound() {
     if [[ "$out_type" == "3" ]]; then
         echo ""; print_line
         local cur_type=$(jq -r '.outbounds[] | select(.tag == "proxy") | .type' "$cfg" 2>/dev/null)
+        local is_tls=$(jq -r '.outbounds[] | select(.tag == "proxy") | .tls.enabled // false' "$cfg" 2>/dev/null)
         
         if [[ -z "$cur_type" ]]; then
             yellow "  当前未配置落地节点 (处于 VPS 直连模式)，无需测试。"
@@ -714,7 +717,12 @@ setup_chain_outbound() {
             if [[ "$cur_type" == "socks" ]]; then
                 [[ -n "$cur_user" ]] && proxy_url="socks5h://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="socks5h://${cur_ip}:${cur_port}"
             elif [[ "$cur_type" == "http" ]]; then
-                [[ -n "$cur_user" ]] && proxy_url="http://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="http://${cur_ip}:${cur_port}"
+                # 兼容 HTTPS 代理测试
+                if [[ "$is_tls" == "true" ]]; then
+                    [[ -n "$cur_user" ]] && proxy_url="https://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="https://${cur_ip}:${cur_port}"
+                else
+                    [[ -n "$cur_user" ]] && proxy_url="http://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="http://${cur_ip}:${cur_port}"
+                fi
             else
                 red "  当前配置的落地协议 ($cur_type) 不支持快捷测试。"
                 sleep 2; return
@@ -735,16 +743,15 @@ setup_chain_outbound() {
             else
                 red "  [✘] 测试失败！无法连接到该代理。"
                 echo -e "      ${LIGHT_PURPLE}排错指南：${PLAIN}"
-                echo "      1. 代理服务器是否宕机 / 流量额度是否耗尽"
-                echo "      2. 服务商的 IP 白名单中，是否已添加当前 VPS 的 IP"
-                echo "      3. 账号密码、端口是否填写错误 (如误将 HTTP 写成 Socks5)"
+                echo "      1. 代理服务器宕机 / 额度耗尽 / IP未加白名单"
+                echo "      2. 端口为 443 时，可能需要开启 TLS 加密 (重新配置并选y)"
             fi
         fi
         echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
         return
     fi
 
-    # 1 & 2. 配置新的落地节点 (强制关闭冲突的 Vision 流控)
+    # 1 & 2. 配置新的落地节点
     if [[ "$out_type" == "1" || "$out_type" == "2" ]]; then
         echo -en " ${LIGHT_YELLOW} ▶ 住宅 IP 地址 (Server IP/域名): ${PLAIN}"; read out_ip
         echo -en " ${LIGHT_YELLOW} ▶ 端口 (Port): ${PLAIN}"; read out_port
@@ -753,8 +760,11 @@ setup_chain_outbound() {
 
         echo -en " ${LIGHT_YELLOW} ▶ 认证用户名 (Username, 若无请留空直接回车): ${PLAIN}"; read out_user
         echo -en " ${LIGHT_YELLOW} ▶ 认证密码 (Password, 若无请留空直接回车): ${PLAIN}"; read out_pass
+        
+        # 新增：代理底层 TLS 询问
+        echo -en " ${LIGHT_YELLOW} ▶ 该代理是否需要 TLS 加密传输 (HTTPS 代理)？(提示: 端口为 443 强烈建议选 y) [y/n] 默认 n: ${PLAIN}"; read out_tls
 
-        # 核心修复点：使用 del(.inbounds[0].users[0].flow) 强制剥离 vision 流控
+        # 生成基本出站结构 (去除 Vision flow)
         if [[ "$out_type" == "1" ]]; then
             if [[ -n "$out_user" ]]; then
                 jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
@@ -777,46 +787,40 @@ setup_chain_outbound() {
             fi
         fi
 
-        if [[ ! -s "$tmp_cfg" ]]; then
-            red "  [错误] 基础代理配置生成失败！(可能是 jq 解析错误)"
-            rm -f "$tmp_cfg"; sleep 2; return
+        # 注入 TLS 设定
+        if [[ "$out_tls" == "y" || "$out_tls" == "Y" ]]; then
+            jq '.outbounds[0] += {"tls": {"enabled": true}}' "$tmp_cfg" > "${tmp_cfg}.tls"
+            mv -f "${tmp_cfg}.tls" "$tmp_cfg"
         fi
 
-        # 智能分流设置与全局路由修复
+        # 分流与路由处理
         echo ""; print_line
         echo -e "  是否开启【流媒体与 AI 智能分流】？"
-        echo -e "  (强烈推荐：仅 Netflix/ChatGPT/Disney 等流量走住宅 IP，普通网页走 VPS 原生网络，极致省流加速)"
         echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 n (全局走代理)]: ${PLAIN}"; read enable_route
         
         if [[ "$enable_route" == "y" || "$enable_route" == "Y" ]]; then
             local route_json='{
                 "rules": [
-                    {
-                        "domain_suffix": [".netflix.com", ".nflxvideo.net", ".nflximg.net", ".openai.com", ".chatgpt.com", ".disneyplus.com", ".dssott.com", ".ipify.org"],
-                        "domain_keyword": ["netflix", "openai", "disney"],
-                        "outbound": "proxy"
-                    }
+                    { "domain_suffix": [".netflix.com", ".nflxvideo.net", ".nflximg.net", ".openai.com", ".chatgpt.com", ".disneyplus.com", ".dssott.com", ".ipify.org"], "domain_keyword": ["netflix", "openai", "disney"], "outbound": "proxy" }
                 ],
                 "final": "direct"
             }'
             jq --argjson route "$route_json" '.route = $route' "$tmp_cfg" > "${tmp_cfg}.2"
             mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            green "  [✔] 已附加智能分流规则 (流媒体/AI 走代理，其余直连)！"
+            green "  [✔] 已附加智能分流规则！"
         else
-            # 核心修复点：为全局模式强制加上 final: proxy
             jq '.route = {"final": "proxy"}' "$tmp_cfg" > "${tmp_cfg}.2"
             mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            yellow "  [!] 未开启分流，已设置为【全局强制路由】至静态住宅 IP。"
+            yellow "  [!] 已设置为【全局强制路由】至住宅 IP。"
         fi
 
         if [ -s "$tmp_cfg" ]; then
             mv -f "$tmp_cfg" "$cfg"
-            systemctl restart sing-box
+            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
             generate_client_configs
             echo ""; print_line
-            green "  🎉 静态住宅 IP 落地配置完成，sing-box 服务已成功重启并接管流量！"
-            yellow "  ⚠️ 注意：由于开启了中转代理，系统已自动关闭 Vision 流控以防冲突。"
-            purple "  💡 重要提示：请务必在您的代理客户端 (v2rayN / Clash 等) 中【更新一次订阅】，否则可能会连不上！"
+            green "  🎉 静态住宅 IP 落地配置完成！"
+            purple "  💡 重要提示：请务必在您的代理客户端 (v2rayN/Clash 等) 中【更新一次订阅】！"
             sleep 4
         else
             red "  [错误] 配置文件最终写入失败！"
