@@ -178,9 +178,6 @@ inst_singbox_core() {
     fi
 }
 
-# =================================================================
-#  4. 多模式信息收集系统 (加入订阅端口手动配置)
-# =================================================================
 collect_base_info() {
     echo -en " ${LIGHT_YELLOW} ▶ 节点显示名称 [回车默认 VLESS_Node]: ${PLAIN}"
     read NODE_NAME
@@ -259,7 +256,7 @@ collect_ws_info() {
 }
 
 # =================================================================
-#  5. 配置动态装配与智能客户端下发
+#  5. 配置动态装配与智能客户端下发 (已修复动态 Flow 识别)
 # =================================================================
 generate_singbox_config() {
     mkdir -p /usr/local/etc/sing-box
@@ -270,7 +267,6 @@ generate_singbox_config() {
         yellow "  正在生成 Reality 密钥对..."
         local keys=$(/usr/local/bin/sing-box generate reality-keypair)
         local private_key=$(echo "$keys" | grep "PrivateKey" | awk -F': ' '{print $2}')
-        # [修复点 1]：提取公钥并持久化保存
         local public_key=$(echo "$keys" | grep "PublicKey" | awk -F': ' '{print $2}')
         echo "$public_key" > /usr/local/etc/sing-box/public_key.meta
         
@@ -361,16 +357,24 @@ generate_client_configs() {
     local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
     local is_ws=$(jq -r '.inbounds[0].transport.type // "tcp"' $cfg)
     
+    # 【修复核心】：动态侦测 Flow 状态，智能同步给客户端
+    local flow=$(jq -r '.inbounds[0].users[0].flow // empty' $cfg)
+    local flow_url=""
+    local clash_flow=""
+    if [[ -n "$flow" && "$flow" != "null" ]]; then
+        flow_url="&flow=${flow}"
+        clash_flow="\n    flow: ${flow}"
+    fi
+    
     local url=""
     local clash_proxy_yaml=""
     local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
 
     if [[ "$is_reality" == "true" ]]; then
-        # [修复点 2]：直接读取刚才生成的公钥，而不是重新推导
         local pbk=$(cat /usr/local/etc/sing-box/public_key.meta 2>/dev/null)
         local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)
-        url="vless://${uuid}@${uri_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${domain}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${uri_ip}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: \"${pbk}\"\n      short-id: \"${sid}\""
+        url="vless://${uuid}@${uri_ip}:${port}?encryption=none${flow_url}&security=reality&sni=${domain}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${safe_node_name}"
+        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${uri_ip}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true${clash_flow}\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: \"${pbk}\"\n      short-id: \"${sid}\""
 
     elif [[ "$is_ws" == "ws" ]]; then
         local ws_path=$(jq -r '.inbounds[0].transport.path' $cfg)
@@ -378,8 +382,8 @@ generate_client_configs() {
         clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: ws\n    tls: true\n    udp: true\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    ws-opts:\n      path: \"${ws_path}\"\n      headers:\n        Host: \"${domain}\""
         
     else
-        url="vless://${uuid}@${domain}:${port}?encryption=none&flow=xtls-rprx-vision&security=tls&sni=${domain}&fp=chrome&type=tcp&headerType=none#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n    servername: \"${domain}\"\n    client-fingerprint: chrome"
+        url="vless://${uuid}@${domain}:${port}?encryption=none${flow_url}&security=tls&sni=${domain}&fp=chrome&type=tcp&headerType=none#${safe_node_name}"
+        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true${clash_flow}\n    servername: \"${domain}\"\n    client-fingerprint: chrome"
     fi
 
     local web_dir="/var/www/vless"
@@ -493,9 +497,6 @@ EOF
     if [[ $SYSTEM == "Alpine" ]]; then rc-service vless-sub restart >/dev/null 2>&1; else systemctl restart vless-sub >/dev/null 2>&1; fi
 }
 
-# =================================================================
-#  6. 服务安装入口与系统管理组件
-# =================================================================
 inst_proxy_core() {
     check_env; inst_singbox_core; generate_singbox_config
 
@@ -662,7 +663,7 @@ showconf() {
 }
 
 # =================================================================
-#  静态住宅 IP 专属落地配置 (极致优化版) - 功能 7
+#  静态住宅 IP 专属落地配置 (已修复 Vision 冲突及强制路由)
 # =================================================================
 setup_chain_outbound() {
     clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
@@ -681,12 +682,16 @@ setup_chain_outbound() {
     echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 请选择代理协议 [0-3]: ${PLAIN}"; read out_type
 
-    # 0. 恢复直连
+    # 0. 恢复直连 (并智能恢复 Vision 流控)
     if [[ "$out_type" == "0" ]]; then
-        if jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }]' "$cfg" > "$tmp_cfg"; then
+        jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
+        if [ -s "$tmp_cfg" ]; then
             mv -f "$tmp_cfg" "$cfg"
             systemctl restart sing-box
-            green "  [✔] 已撤销住宅 IP 落地，恢复为 VPS 全局直连模式！"; sleep 2; return
+            generate_client_configs
+            green "  [✔] 已撤销住宅 IP 落地，恢复为 VPS 全局直连模式 (已重新开启 Vision 加速)！"
+            purple "  💡 重要提示：节点配置参数已自动更新，请务必在客户端【更新一次订阅】！"
+            sleep 3; return
         else
             red "  [✘] 配置文件修改失败！"; sleep 2; return
         fi
@@ -707,7 +712,6 @@ setup_chain_outbound() {
             
             local proxy_url=""
             if [[ "$cur_type" == "socks" ]]; then
-                # 优化: 使用 socks5h 强制远端解析 DNS
                 [[ -n "$cur_user" ]] && proxy_url="socks5h://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="socks5h://${cur_ip}:${cur_port}"
             elif [[ "$cur_type" == "http" ]]; then
                 [[ -n "$cur_user" ]] && proxy_url="http://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="http://${cur_ip}:${cur_port}"
@@ -724,7 +728,6 @@ setup_chain_outbound() {
                 yellow "  ▶ 代理入口地址: $cur_ip:$cur_port"
                 yellow "  ▶ 实际出口 IP : $test_ip"
                 
-                # 获取 IP 归属地和 ISP 信息
                 local ip_info=$(curl -x "$proxy_url" -sL -m 10 "http://ip-api.com/json/$test_ip?lang=zh-CN" 2>/dev/null)
                 local country=$(echo "$ip_info" | jq -r '.country // "未知"')
                 local isp=$(echo "$ip_info" | jq -r '.isp // "未知"')
@@ -734,62 +737,58 @@ setup_chain_outbound() {
                 echo -e "      ${LIGHT_PURPLE}排错指南：${PLAIN}"
                 echo "      1. 代理服务器是否宕机 / 流量额度是否耗尽"
                 echo "      2. 服务商的 IP 白名单中，是否已添加当前 VPS 的 IP"
-                echo "      3. 账号密码、端口是否填写错误"
+                echo "      3. 账号密码、端口是否填写错误 (如误将 HTTP 写成 Socks5)"
             fi
         fi
         echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
         return
     fi
 
-    # 1 & 2. 配置新的落地节点
+    # 1 & 2. 配置新的落地节点 (强制关闭冲突的 Vision 流控)
     if [[ "$out_type" == "1" || "$out_type" == "2" ]]; then
         echo -en " ${LIGHT_YELLOW} ▶ 住宅 IP 地址 (Server IP/域名): ${PLAIN}"; read out_ip
         echo -en " ${LIGHT_YELLOW} ▶ 端口 (Port): ${PLAIN}"; read out_port
         
-        # 优化: 拦截空输入防呆
         [[ -z "$out_ip" || -z "$out_port" ]] && { red "  [错误] IP 和 端口不能为空！操作取消。"; sleep 2; return; }
 
         echo -en " ${LIGHT_YELLOW} ▶ 认证用户名 (Username, 若无请留空直接回车): ${PLAIN}"; read out_user
         echo -en " ${LIGHT_YELLOW} ▶ 认证密码 (Password, 若无请留空直接回车): ${PLAIN}"; read out_pass
 
-        # 生成 Outbound JSON 结构
+        # 核心修复点：使用 del(.inbounds[0].users[0].flow) 强制剥离 vision 流控
         if [[ "$out_type" == "1" ]]; then
             if [[ -n "$out_user" ]]; then
                 jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
-                '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
+                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             else
                 jq --arg ip "$out_ip" --arg port "$out_port" \
-                '.outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' \
+                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             fi
         elif [[ "$out_type" == "2" ]]; then
             if [[ -n "$out_user" ]]; then
                 jq --arg ip "$out_ip" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
-                '.outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
+                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             else
                 jq --arg ip "$out_ip" --arg port "$out_port" \
-                '.outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber) }, {"type":"direct", "tag":"direct"}]' \
+                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber) }, {"type":"direct", "tag":"direct"}]' \
                 "$cfg" > "$tmp_cfg"
             fi
         fi
 
-        # 优化: 如果基础配置生成失败，直接熔断
         if [[ ! -s "$tmp_cfg" ]]; then
             red "  [错误] 基础代理配置生成失败！(可能是 jq 解析错误)"
             rm -f "$tmp_cfg"; sleep 2; return
         fi
 
-        # 智能分流设置
+        # 智能分流设置与全局路由修复
         echo ""; print_line
         echo -e "  是否开启【流媒体与 AI 智能分流】？"
         echo -e "  (强烈推荐：仅 Netflix/ChatGPT/Disney 等流量走住宅 IP，普通网页走 VPS 原生网络，极致省流加速)"
-        echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 y]: ${PLAIN}"; read enable_route
-        [[ -z "$enable_route" ]] && enable_route="y" # 优化: 默认改为y
-
+        echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 n (全局走代理)]: ${PLAIN}"; read enable_route
+        
         if [[ "$enable_route" == "y" || "$enable_route" == "Y" ]]; then
-            # 定义路由规则 JSON 并安全注入
             local route_json='{
                 "rules": [
                     {
@@ -804,19 +803,21 @@ setup_chain_outbound() {
             mv -f "${tmp_cfg}.2" "$tmp_cfg"
             green "  [✔] 已附加智能分流规则 (流媒体/AI 走代理，其余直连)！"
         else
-            jq 'del(.route)' "$tmp_cfg" > "${tmp_cfg}.2"
+            # 核心修复点：为全局模式强制加上 final: proxy
+            jq '.route = {"final": "proxy"}' "$tmp_cfg" > "${tmp_cfg}.2"
             mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            yellow "  [!] 未开启分流，已设置为全局流量转发至静态住宅 IP。"
+            yellow "  [!] 未开启分流，已设置为【全局强制路由】至静态住宅 IP。"
         fi
 
-        # 最终应用配置
         if [ -s "$tmp_cfg" ]; then
             mv -f "$tmp_cfg" "$cfg"
             systemctl restart sing-box
+            generate_client_configs
             echo ""; print_line
             green "  🎉 静态住宅 IP 落地配置完成，sing-box 服务已成功重启并接管流量！"
-            purple "  💡 提示：您可以再次进入此菜单，选择 [3] 测试刚才配置的代理是否连通。"
-            sleep 3
+            yellow "  ⚠️ 注意：由于开启了中转代理，系统已自动关闭 Vision 流控以防冲突。"
+            purple "  💡 重要提示：请务必在您的代理客户端 (v2rayN / Clash 等) 中【更新一次订阅】，否则可能会连不上！"
+            sleep 4
         else
             red "  [错误] 配置文件最终写入失败！"
             rm -f "$tmp_cfg"; sleep 2
