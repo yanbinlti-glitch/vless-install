@@ -44,4 +44,4 @@
 请在登录 VPS 后（确保具有 `root` 权限），直接复制并运行以下**一键安装命令**：
 
 ```bash
-wget -O vless.sh [https://raw.githubusercontent.com/yanbinlti-glitch/YOUR_REPO_NAME/main/vless.sh](https://raw.githubusercontent.com/yanbinlti-glitch/YOUR_REPO_NAME/main/vless.sh) && chmod +x vless.sh && sudo ./vless.sh
+wget -O vless.sh https://raw.githubusercontent.com/yanbinlti-glitch/vless-install/main/vless.sh && chmod +x vless.sh && sudo ./vless.sh
