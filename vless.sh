@@ -4,7 +4,7 @@ export LANG=en_US.UTF-8
 export DEBIAN_FRONTEND=noninteractive
 
 # =================================================================
-#  1. 现代化极简 UI 色彩库 (原汁原味保留)
+#  1. 现代化极简 UI 色彩库
 # =================================================================
 RED="\033[31m"
 GREEN="\033[32m"
@@ -31,11 +31,12 @@ print_line() {
 # =================================================================
 [[ $EUID -ne 0 ]] && red " [错误] 请在 root 用户下运行此脚本！" && exit 1
 
+# 安全提取脚本路径
 SCRIPT_PATH=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
 if [[ -f "$SCRIPT_PATH" && "$(head -n 1 "$SCRIPT_PATH" 2>/dev/null)" == "#!/bin/bash" ]]; then
-    if [[ "$SCRIPT_PATH" != "/usr/local/bin/vvv" ]]; then
-        cp -f "$SCRIPT_PATH" /usr/local/bin/vvv
-        chmod +x /usr/local/bin/vvv
+    if [[ "$SCRIPT_PATH" != "/usr/local/bin/hy2" ]]; then
+        cp -f "$SCRIPT_PATH" /usr/local/bin/hy2
+        chmod +x /usr/local/bin/hy2
     fi
 fi
 
@@ -61,351 +62,654 @@ done
 [[ -z $SYSTEM ]] && red " [错误] 目前暂不支持您的 VPS 操作系统！" && exit 1
 
 if [[ -z $(type -P curl) ]]; then
-    [[ ! $SYSTEM == "CentOS" ]] && { $PKG_UPDATE || true; }
+    [[ ! $SYSTEM == "CentOS" ]] && { $PKG_UPDATE || { echo ""; red " [错误] 系统软件源更新失败！"; exit 1; }; }
     $PKG_INSTALL curl || { echo ""; red " [错误] curl 安装失败！请检查网络或系统源。"; exit 1; }
 fi
 
 realip() {
+    # 强制优先获取 IPv4，避免双栈环境误伤
     ip=$(curl -s4m3 api.ipify.org -k || curl -s4m3 ifconfig.me -k || curl -s4m3 ip.sb -k)
+    
+    # 降级尝试获取 IPv6 (纯 IPv6 环境)
     if [[ -z "$ip" ]]; then
         ip=$(curl -s6m3 api64.ipify.org -k || curl -s6m3 ifconfig.me -k || curl -s6m3 ip.sb -k)
     fi
+    
     ip=$(echo "$ip" | grep -m 1 -E -o "([0-9]{1,3}[\.]){3}[0-9]{1,3}|([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:)*:[0-9a-fA-F]{1,4}")
-    [[ -z "$ip" ]] && red " [错误] 无法获取本机的公网 IP！" && exit 1
+    
+    if [[ -z "$ip" ]]; then
+        echo ""
+        red " [错误] 无法获取本机的公网 IP，请检查 VPS 的网络连接或 DNS 设置！"
+        exit 1
+    fi
 }
 
 gen_random_str() {
     local len=$1
     local str=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')
-    [[ -z "$str" ]] && str=$(head -c 16 /dev/urandom | od -A n -t x1 | tr -d ' \n')
+    if [[ -z "$str" ]]; then
+        str=$(head -c 16 /dev/urandom | od -A n -t x1 | tr -d ' \n')
+    fi
     echo "${str:0:$len}"
 }
 
-# 【优化 1】修复防火墙规则冗余 (先删后加)
+# =================================================================
+#  3. 服务管理与防火墙控制封装
+# =================================================================
+svc_start()   { if [[ $SYSTEM == "Alpine" ]]; then rc-service "$1" start; else systemctl start "$1"; fi; }
+svc_stop()    { if [[ $SYSTEM == "Alpine" ]]; then rc-service "$1" stop; else systemctl stop "$1"; fi; }
+svc_enable()  { if [[ $SYSTEM == "Alpine" ]]; then rc-update add "$1" default; else systemctl enable "$1"; fi; }
+svc_disable() { if [[ $SYSTEM == "Alpine" ]]; then rc-update del "$1" default; else systemctl disable "$1"; fi; }
+
+save_iptables() {
+    if [[ $SYSTEM == "Alpine" ]]; then
+        rc-service iptables save 2>/dev/null
+        rc-service ip6tables save 2>/dev/null
+    elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
+        service iptables save 2>/dev/null
+        service ip6tables save 2>/dev/null
+    else
+        if command -v netfilter-persistent >/dev/null; then
+            netfilter-persistent save 2>/dev/null
+        fi
+    fi
+}
+
 open_port() {
     local port=$1
-    if command -v ufw >/dev/null && ufw status | grep -qw active; then
-        ufw allow $port/tcp >/dev/null 2>&1
-    elif command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then
-        firewall-cmd --zone=public --add-port=$port/tcp --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-    else
-        iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        ip6tables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        ip6tables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        if [[ $SYSTEM == "Alpine" ]]; then rc-service iptables save 2>/dev/null; elif command -v netfilter-persistent >/dev/null; then netfilter-persistent save 2>/dev/null; fi
+    local proto=$2
+    iptables -I INPUT -p $proto --dport $port -j ACCEPT 2>/dev/null
+    ip6tables -I INPUT -p $proto --dport $port -j ACCEPT 2>/dev/null
+    if command -v ufw >/dev/null; then ufw allow $port/$proto 2>/dev/null; fi
+    if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --zone=public --add-port=$port/$proto --permanent 2>/dev/null
+        firewall-cmd --reload 2>/dev/null
     fi
+    save_iptables
 }
 
-# 【优化 1】修复防火墙规则冗余 (循环彻底清除)
 close_port() {
     local port=$1
-    if command -v ufw >/dev/null && ufw status | grep -qw active; then
-        ufw delete allow $port/tcp >/dev/null 2>&1
-    elif command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then
-        firewall-cmd --zone=public --remove-port=$port/tcp --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-    else
-        while iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; do
-            iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        done
-        while ip6tables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; do
-            ip6tables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-        done
-        if [[ $SYSTEM == "Alpine" ]]; then rc-service iptables save 2>/dev/null; elif command -v netfilter-persistent >/dev/null; then netfilter-persistent save 2>/dev/null; fi
+    local proto=$2
+    iptables -D INPUT -p $proto --dport $port -j ACCEPT 2>/dev/null
+    ip6tables -D INPUT -p $proto --dport $port -j ACCEPT 2>/dev/null
+    if command -v ufw >/dev/null; then ufw delete allow $port/$proto 2>/dev/null; fi
+    if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --zone=public --remove-port=$port/$proto --permanent 2>/dev/null
+        firewall-cmd --reload 2>/dev/null
     fi
-}
-
-check_domain_dns() {
-    local domain=$1
-    echo ""
-    yellow "  正在验证 [$domain] 的解析记录..."
-    realip
-    local local_ip=$ip
-    local domain_ip=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" | grep -oP '"data":"\K[^"]+' | head -1 2>/dev/null)
-    [[ -z "$domain_ip" ]] && domain_ip=$(ping -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
-
-    if [[ "$domain_ip" == "$local_ip" ]]; then
-        green "   [✔] 完美！域名已成功解析到本机 (IP: $domain_ip)"
-        return 0
-    elif [[ -n "$domain_ip" ]]; then
-        red "   [✘] 解析不匹配！本机 IP: $local_ip, 域名 IP: $domain_ip"
-        return 1
-    else
-        red "   [✘] 解析失败！未查询到该域名的 A 记录。"
-        return 1
-    fi
+    save_iptables
 }
 
 # =================================================================
-#  3. 环境检查与核心安装
+#  4. 环境检查与预处理
 # =================================================================
 check_env() {
-    clear; echo ""; print_line; green "                   系统依赖与环境检查                      "; print_line; echo ""
-    yellow "  正在检查并补全前置依赖 (含 jq, curl, openssl)..."
-    [[ ! $SYSTEM == "CentOS" ]] && $PKG_UPDATE >/dev/null 2>&1
-    if [[ $SYSTEM == "Alpine" ]]; then
-        $PKG_INSTALL curl wget sudo procps iptables iproute2 python3 openssl tar gzip jq gcompat libc6-compat >/dev/null 2>&1
-        mkdir -p /lib64 && [[ ! -f /lib64/ld-linux-x86-64.so.2 ]] && ln -s /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2 2>/dev/null
-    elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
-        $PKG_INSTALL epel-release >/dev/null 2>&1 || true
-        $PKG_INSTALL curl wget sudo procps iptables iproute python3 openssl tar gzip jq >/dev/null 2>&1
-    else
-        $PKG_INSTALL curl wget sudo procps iptables-persistent netfilter-persistent iproute2 python3 openssl tar gzip jq >/dev/null 2>&1
-    fi
-    green "  [✔] 所有前置依赖补全完成！"; sleep 1
-}
-
-# 【优化 4】优化 GitHub API 速率限制问题
-inst_singbox_core() {
-    echo ""; print_line; yellow "  正在下载 sing-box 二进制核心..."; 
-    local arch=$(uname -m); local sb_arch=""
-    case $arch in
-        x86_64) sb_arch="amd64" ;;
-        aarch64) sb_arch="arm64" ;;
-        s390x) sb_arch="s390x" ;;
-        *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
-    esac
-    
-    local sb_version=$(curl -Ls -o /dev/null -w %{url_effective} "https://github.com/SagerNet/sing-box/releases/latest" | sed 's|.*/tag/v||')
-    [[ -z "$sb_version" ]] && sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败！" && exit 1
-    
-    green "  获取到最新版本: v${sb_version}"
-    wget --timeout=10 --tries=3 -N -q -O /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${sb_version}/sing-box-${sb_version}-linux-${sb_arch}.tar.gz"
-    [[ ! -s /tmp/sing-box.tar.gz ]] && red " [错误] 核心下载失败！" && exit 1
-    
-    mkdir -p /usr/local/bin
-    tar -xzf /tmp/sing-box.tar.gz -C /tmp/ >/dev/null 2>&1
-    cp -f /tmp/sing-box-${sb_version}-linux-${sb_arch}/sing-box /usr/local/bin/sing-box
-    chmod +x /usr/local/bin/sing-box
-    rm -rf /tmp/sing-box.tar.gz /tmp/sing-box-${sb_version}-linux-${sb_arch}
-    
-    if ! /usr/local/bin/sing-box version >/dev/null 2>&1; then
-        red " [致命错误] 核心无法在当前系统运行！可能是不兼容的架构或缺失底层 C 库。" && exit 1
-    fi
-}
-
-collect_base_info() {
-    echo -en " ${LIGHT_YELLOW} ▶ 节点显示名称 [回车默认 VLESS_Node]: ${PLAIN}"
-    read NODE_NAME
-    [[ -z $NODE_NAME ]] && NODE_NAME="VLESS_Node"
-
-    while true; do
-        echo -en " ${LIGHT_YELLOW} ▶ 设置订阅服务端口 [1000-65535] (回车随机): ${PLAIN}"
-        read SUB_PORT_INPUT
-        if [[ -z $SUB_PORT_INPUT ]]; then
-            SUB_PORT=$(shuf -i 10000-65535 -n 1)
-            break
-        elif [[ "$SUB_PORT_INPUT" =~ ^[0-9]+$ ]] && [ "$SUB_PORT_INPUT" -ge 1000 ] && [ "$SUB_PORT_INPUT" -le 65535 ]; then
-            if ss -tnl | grep -E -q ":$SUB_PORT_INPUT( |$)"; then
-                red " [警告] 该端口已被占用，请重新输入！"
-            else
-                SUB_PORT=$SUB_PORT_INPUT
-                break
-            fi
-        else
-            red " [错误] 请输入有效的端口号 (1000-65535)！"
-        fi
-    done
-}
-
-collect_reality_info() {
-    echo ""; print_line; green "               配置 VLESS + TCP + Reality               "; print_line; echo ""
-    while true; do
-        echo -en " ${LIGHT_YELLOW} ▶ 设置主端口 [10000-65535] (回车随机): ${PLAIN}"
-        read NODE_PORT
-        [[ -z $NODE_PORT ]] && NODE_PORT=$(shuf -i 10000-65535 -n 1)
-        if [[ "$NODE_PORT" =~ ^[0-9]+$ ]] && [ "$NODE_PORT" -ge 10000 ] && [ "$NODE_PORT" -le 65535 ]; then
-            ss -tnl | grep -E -q ":$NODE_PORT( |$)" && red " [警告] 端口已被占用！" || break
-        fi
-    done
-    echo -en " ${LIGHT_YELLOW} ▶ 设置 Reality 伪装域名 (SNI) [回车默认 www.bing.com]: ${PLAIN}"
-    read NODE_DOMAIN
-    [[ -z $NODE_DOMAIN ]] && NODE_DOMAIN="www.bing.com"
-    collect_base_info
-}
-
-collect_tls_info() {
-    echo ""; print_line; green "               配置 VLESS + TCP + TLS (ACME)            "; print_line; echo ""
-    while true; do
-        echo -en " ${LIGHT_YELLOW} ▶ 请输入已解析到本机的真实域名 (如 vless.domain.com): ${PLAIN}"
-        read NODE_DOMAIN
-        [[ -z "$NODE_DOMAIN" ]] && continue
-        if check_domain_dns "$NODE_DOMAIN"; then break; else
-            echo -en " ${LIGHT_YELLOW} ▶ 是否强制跳过校验？(选y自担证书申请失败风险) [y/N]: ${PLAIN}"
-            read f_skip; [[ "$f_skip" == "y" || "$f_skip" == "Y" ]] && break
-        fi
-    done
-    NODE_PORT=443
-    if ss -tnl | grep -E -q ":443( |$)"; then red " [致命错误] 本机 443 端口已被占用，请先停止占用程序 (如 Nginx)！"; exit 1; fi
-    collect_base_info
-}
-
-# 【优化 2】增加 Cloudflare ALPN 警告
-collect_ws_info() {
-    echo ""; print_line; green "            配置 VLESS + WS + TLS (CDN 救星)            "; print_line; echo ""
-    red "  ⚠️ [重要警告] 如果您使用 Cloudflare 等 CDN 服务，请务必先将域名解析设置为"
-    red "               【仅 DNS (灰云)】状态！等脚本部署完成且证书申请成功后，"
-    red "               再到 CDN 面板开启代理 (小黄云)，否则将导致 TLS 证书申请失败！"
+    clear
     echo ""
-    while true; do
-        echo -en " ${LIGHT_YELLOW} ▶ 请输入真实域名 (若套 CDN，请确保 SSL 设为 Full Strict): ${PLAIN}"
-        read NODE_DOMAIN
-        [[ -z "$NODE_DOMAIN" ]] && continue
-        if check_domain_dns "$NODE_DOMAIN"; then break; else
-            echo -en " ${LIGHT_YELLOW} ▶ 是否强制跳过校验？(套了 CDN 查不出本机 IP 属正常，选 y 即可) [y/N]: ${PLAIN}"
-            read f_skip; [[ "$f_skip" == "y" || "$f_skip" == "Y" ]] && break
+    print_line
+    green "                   系统依赖与环境检查                      "
+    print_line
+    echo ""
+    green "  当前操作系统: $SYSTEM"
+    yellow "  正在检查 Hysteria 2 核心及前置依赖包..."
+    echo ""
+    
+    local cmds=("curl" "wget" "sudo" "ss" "iptables" "python3" "openssl" "socat" "qrencode")
+    local missing=0
+
+    for cmd in "${cmds[@]}"; do
+        if ! command -v "$cmd" > /dev/null; then
+            red "   [✘] 缺失:  $cmd"
+            missing=1
+        else
+            green "   [✔] 正常:  $cmd"
         fi
     done
-    NODE_PORT=443
-    if ss -tnl | grep -E -q ":443( |$)"; then red " [致命错误] 443 端口已被占用！"; exit 1; fi
-    local rand_path=$(gen_random_str 8)
-    echo -en " ${LIGHT_YELLOW} ▶ 设置 WebSocket 路径 [回车默认 /dora-${rand_path}]: ${PLAIN}"
-    read WS_PATH
-    [[ -z $WS_PATH ]] && WS_PATH="/dora-${rand_path}"
-    [[ "$WS_PATH" != /* ]] && WS_PATH="/${WS_PATH}"
-    collect_base_info
-}
 
-# =================================================================
-#  5. 配置动态装配与智能客户端下发
-# =================================================================
-generate_singbox_config() {
-    mkdir -p /usr/local/etc/sing-box
-    local vless_uuid=$(/usr/local/bin/sing-box generate uuid)
-    local json_content=""
-
-    if [[ $INSTALL_MODE -eq 1 ]]; then
-        yellow "  正在生成 Reality 密钥对..."
-        local keys=$(/usr/local/bin/sing-box generate reality-keypair)
-        local private_key=$(echo "$keys" | grep "PrivateKey" | awk -F': ' '{print $2}')
-        local public_key=$(echo "$keys" | grep "PublicKey" | awk -F': ' '{print $2}')
-        echo "$public_key" > /usr/local/etc/sing-box/public_key.meta
-        
-        local short_id=$(openssl rand -hex 8)
-        json_content=$(cat <<EOF
-{
-  "log": { "level": "warn", "timestamp": true },
-  "inbounds": [{
-    "type": "vless", "tag": "vless-in",
-    "listen": "0.0.0.0", "listen_port": $NODE_PORT,
-    "users": [{ "uuid": "$vless_uuid", "flow": "xtls-rprx-vision" }],
-    "tls": {
-      "enabled": true, "server_name": "$NODE_DOMAIN",
-      "reality": {
-        "enabled": true, "handshake": { "server": "$NODE_DOMAIN", "server_port": 443 },
-        "private_key": "$private_key", "short_id": ["$short_id"]
-      }
-    }
-  }],
-  "outbounds": [{ "type": "direct", "tag": "direct" }]
-}
-EOF
-)
-    elif [[ $INSTALL_MODE -eq 2 ]]; then
-        json_content=$(cat <<EOF
-{
-  "log": { "level": "warn", "timestamp": true },
-  "inbounds": [{
-    "type": "vless", "tag": "vless-tls-in",
-    "listen": "0.0.0.0", "listen_port": $NODE_PORT,
-    "users": [{ "uuid": "$vless_uuid", "flow": "xtls-rprx-vision" }],
-    "tls": {
-      "enabled": true, "server_name": "$NODE_DOMAIN",
-      "acme": {
-        "domain": ["$NODE_DOMAIN"], "data_directory": "/usr/local/etc/sing-box",
-        "default_server_name": "$NODE_DOMAIN", "email": "admin@$NODE_DOMAIN"
-      }
-    }
-  }],
-  "outbounds": [{ "type": "direct", "tag": "direct" }]
-}
-EOF
-)
-    elif [[ $INSTALL_MODE -eq 3 ]]; then
-        json_content=$(cat <<EOF
-{
-  "log": { "level": "warn", "timestamp": true },
-  "inbounds": [{
-    "type": "vless", "tag": "vless-ws-in",
-    "listen": "0.0.0.0", "listen_port": $NODE_PORT,
-    "users": [{ "uuid": "$vless_uuid" }],
-    "tls": {
-      "enabled": true, "server_name": "$NODE_DOMAIN",
-      "acme": {
-        "domain": ["$NODE_DOMAIN"], "data_directory": "/usr/local/etc/sing-box",
-        "default_server_name": "$NODE_DOMAIN", "email": "admin@$NODE_DOMAIN"
-      }
-    },
-    "transport": {
-      "type": "ws", "path": "$WS_PATH",
-      "max_early_data": 2048, "early_data_header_name": "Sec-WebSocket-Protocol"
-    }
-  }],
-  "outbounds": [{ "type": "direct", "tag": "direct" }]
-}
-EOF
-)
+    if ! command -v crontab > /dev/null; then
+        red "   [✘] 缺失:  crontab (用于证书自动续期)"
+        missing=1
+    else
+        green "   [✔] 正常:  crontab"
     fi
 
-    echo "$json_content" > /usr/local/etc/sing-box/config.json
-    chmod 600 /usr/local/etc/sing-box/config.json
-    echo "$NODE_NAME" > /usr/local/etc/sing-box/node_name.meta
-    
-    echo "$SUB_PORT" > /usr/local/etc/sing-box/sub_port.meta
-    open_port $NODE_PORT; open_port $SUB_PORT
+    if [[ $SYSTEM == "Debian" || $SYSTEM == "Ubuntu" ]]; then
+        if ! command -v netfilter-persistent > /dev/null; then
+            red "   [✘] 缺失:  netfilter-persistent (用于防火墙保存)"
+            missing=1
+        else
+            green "   [✔] 正常:  netfilter-persistent"
+        fi
+    fi
+
+    if [[ $missing -eq 1 ]]; then
+        echo ""
+        print_line
+        yellow "  发现缺失前置组件，正在为您自动拉取安装，执行日志如下..."
+        echo ""
+        
+        [[ ! $SYSTEM == "CentOS" ]] && { $PKG_UPDATE || { echo ""; red " [错误] 系统软件源更新失败！请检查网络连接或更换软件源后重试。"; exit 1; }; }
+        
+        if [[ $SYSTEM == "Alpine" ]]; then
+            $PKG_INSTALL curl wget sudo procps iptables ip6tables iproute2 python3 openssl socat cronie libqrencode-tools || { echo ""; red " [错误] 前置依赖安装失败！请检查系统源或网络后重试。"; exit 1; }
+            svc_start crond; svc_enable crond
+        elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
+            $PKG_INSTALL epel-release || { echo ""; red " [错误] epel-release 扩展源安装失败！"; exit 1; }
+            $PKG_INSTALL curl wget sudo procps iptables iptables-services iproute python3 openssl socat cronie qrencode || { echo ""; red " [错误] 前置依赖安装失败！请检查系统源或网络后重试。"; exit 1; }
+            svc_start crond; svc_enable crond
+        else
+            yellow "  正在尝试修复并清理系统损坏的依赖项..."
+            apt-get --fix-broken install -y || { echo ""; red " [错误] 尝试修复系统损坏的依赖项失败！"; exit 1; }
+            apt-get autoremove -y
+            apt-get clean
+            $PKG_INSTALL curl wget sudo procps iptables-persistent netfilter-persistent iproute2 python3 openssl socat cron qrencode || { echo ""; red " [错误] 前置依赖安装失败！请检查 APT 源或网络后重试。"; exit 1; }
+            svc_start cron; svc_enable cron
+        fi
+        
+        echo ""
+        green "  所有前置依赖补全完成！"
+    else
+        echo ""
+        print_line
+        green "  所有前置依赖检查通过，环境完美，无需额外安装！"
+    fi
+    sleep 2
 }
 
-# 【优化 3】优化 Python 服务端：取消内存死缓存，动态读取订阅内容
+# =================================================================
+#  5. 安装交互核心流程
+# =================================================================
+inst_cert() {
+    clear
+    echo ""
+    print_line
+    green "                    Hysteria 2 证书配置                    "
+    print_line
+    echo ""
+    echo -e "    ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}必应自签伪装证书 (单人独享/免域名，默认)${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_PURPLE}Acme 脚本申请 (需 Cloudflare 域名托管)${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}自定义证书路径${PLAIN}"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [1-3] (默认1): ${PLAIN}"
+    read certInput
+    [[ -z "$certInput" ]] && certInput=1
+
+    if [[ "$certInput" == 2 ]]; then
+        cert_path="/root/cert.crt"
+        key_path="/root/private.key"
+        if [[ -f /root/cert.crt && -f /root/private.key && -f /root/ca.log ]]; then
+            domain=$(cat /root/ca.log | tr -d '\r')
+            echo ""
+            green " 检测到原有域名：$domain 的证书，正在直接应用..."
+            hy_domain="$domain"
+        else
+            realip
+            echo ""
+            echo -en " ${LIGHT_YELLOW} ▶ 请输入需要申请证书的域名: ${PLAIN}"
+            read domain
+            [[ -z "$domain" ]] && red " 未输入域名，无法执行操作！" && exit 1
+            domain=$(echo "$domain" | tr -d '\r' | tr -d ' ')
+            green " 已记录域名：$domain"
+            
+            # 双栈适配：优先提取 IPv4 进行核对
+            domainIP=$(DOMAIN="$domain" python3 -c "import socket, os; try: addrs=socket.getaddrinfo(os.environ.get('DOMAIN'), None); ips=[a[4][0] for a in addrs]; v4=[ip for ip in ips if '.' in ip]; print(v4[0] if v4 else ips[0]) except: print('')" 2>/dev/null || echo "")
+            
+            if [[ -z "$domainIP" ]]; then
+                echo ""
+                yellow " [警告] 无法解析域名 ${domain} 的 IP 地址！请确认域名已正确解析。"
+                echo -en " ${LIGHT_YELLOW} ▶ 是否强制继续？(y/n) [默认: y]: ${PLAIN}"
+                read force_cert
+                [[ -z "$force_cert" ]] && force_cert="y"
+                [[ "$force_cert" != "y" && "$force_cert" != "Y" ]] && exit 1
+            elif [[ "$domainIP" != "$ip" ]]; then
+                echo ""
+                yellow " [警告] 域名解析的 IP ($domainIP) 与当前真实 IP ($ip) 不完全匹配！"
+                yellow " [提示] 如果您的服务器是纯 IPv6 环境，这可能是由于 IPv6 缩写格式不一致导致的误报。"
+                yellow " [警告] Hysteria 2 必须使用真实 IP 直连，请确保 Cloudflare 已关闭小云朵 (DNS Only)。"
+                echo -en " ${LIGHT_YELLOW} ▶ 是否确认并继续？(y/n) [默认: y]: ${PLAIN}"
+                read force_cert
+                [[ -z "$force_cert" ]] && force_cert="y"
+                [[ "$force_cert" != "y" && "$force_cert" != "Y" ]] && exit 1
+            fi
+
+            echo ""
+            print_line
+            yellow "  准备使用 Cloudflare DNS API 申请证书"
+            print_line
+            echo ""
+            echo -en " ${LIGHT_YELLOW} ▶ 选择认证方式 [1. API Token(推荐) | 2. Global API Key]: ${PLAIN}"
+            read cf_auth_choice
+            [[ -z "$cf_auth_choice" ]] && cf_auth_choice=1
+
+            install_acme() {
+                local acme_email="$1"
+                if [[ ! -f "/root/.acme.sh/acme.sh" ]]; then
+                    yellow "  正在安全拉取 Acme.sh 安装脚本..."
+                    curl -sL --max-time 20 -o /tmp/acme_install.sh https://get.acme.sh || curl -sL --max-time 20 -o /tmp/acme_install.sh https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh
+                    if [[ ! -s /tmp/acme_install.sh ]]; then
+                        red "  [错误] Acme.sh 下载失败！请检查网络连接或更换 DNS。"
+                        rm -f /tmp/acme_install.sh
+                        exit 1
+                    fi
+                    sh /tmp/acme_install.sh email="$acme_email" || { red "  [错误] Acme.sh 安装过程报错！"; rm -f /tmp/acme_install.sh; exit 1; }
+                    rm -f /tmp/acme_install.sh
+                fi
+            }
+
+            if [[ "$cf_auth_choice" == 1 ]]; then
+                echo -en " ${LIGHT_YELLOW} ▶ 请输入 Cloudflare API Token: ${PLAIN}"
+                read cf_token
+                [[ -z "$cf_token" ]] && red " Token 不能为空！" && exit 1
+                export CF_Token="$(echo "$cf_token" | tr -d '\r' | tr -d ' ')"
+                install_acme "admin@${domain}"
+            else
+                echo -en " ${LIGHT_YELLOW} ▶ 请输入 Cloudflare 账号邮箱: ${PLAIN}"
+                read cf_email
+                echo -en " ${LIGHT_YELLOW} ▶ 请输入 Cloudflare Global API Key: ${PLAIN}"
+                read cf_key
+                [[ -z "$cf_email" || -z "$cf_key" ]] && red " 邮箱或 Key 不能为空！" && exit 1
+                export CF_Email="$(echo "$cf_email" | tr -d '\r' | tr -d ' ')"
+                export CF_Key="$(echo "$cf_key" | tr -d '\r' | tr -d ' ')"
+                install_acme "$CF_Email"
+            fi
+            
+            bash /root/.acme.sh/acme.sh --upgrade --auto-upgrade
+            bash /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+            rm -f /root/cert.crt /root/private.key /root/ca.log
+
+            yellow " 正在通过 DNS API 验证所有权，请留意下方执行日志 (约1-3分钟)..."
+            bash /root/.acme.sh/acme.sh --issue --dns dns_cf -d "${domain}" -k ec-256
+            mkdir -p /var/www/hysteria/certs
+
+            # 使用 try-restart 增强鲁棒性
+            if [[ $SYSTEM == "Alpine" ]]; then
+                local reload_cmd="cp -f /root/cert.crt /var/www/hysteria/certs/cert.crt && cp -f /root/private.key /var/www/hysteria/certs/private.key && chown -R nobody /var/www/hysteria/certs && (rc-service hysteria-server restart || true) && (rc-service hysteria-sub restart || true)"
+            else
+                local reload_cmd="cp -f /root/cert.crt /var/www/hysteria/certs/cert.crt && cp -f /root/private.key /var/www/hysteria/certs/private.key && chown -R nobody /var/www/hysteria/certs && (systemctl try-restart hysteria-server || true) && (systemctl try-restart hysteria-sub || true)"
+            fi
+            
+            bash /root/.acme.sh/acme.sh --install-cert -d "${domain}" --key-file /root/private.key --fullchain-file /root/cert.crt --ecc --reloadcmd "$reload_cmd"
+            
+            if [[ -f /root/cert.crt && -f /root/private.key ]]; then
+                echo "$domain" > /root/ca.log
+                chmod 644 /root/cert.crt; chmod 600 /root/private.key
+                green " 证书申请成功！已保存至 /root/ 目录下。"
+                hy_domain="$domain"
+            else
+                red " [错误] 证书申请失败！请向上翻阅执行日志检查具体报错信息。"
+                exit 1
+            fi
+        fi
+    elif [[ "$certInput" == 3 ]]; then
+        echo ""
+        while true; do
+            echo -en " ${LIGHT_YELLOW} ▶ 请输入公钥(crt)的绝对路径: ${PLAIN}"
+            read cert_path
+            cert_path=$(echo "$cert_path" | tr -d '\r' | tr -d ' ')
+            if [[ -f "$cert_path" ]]; then break; else red " [错误] 文件不存在，请重新输入！"; fi
+        done
+        while true; do
+            echo -en " ${LIGHT_YELLOW} ▶ 请输入密钥(key)的绝对路径: ${PLAIN}"
+            read key_path
+            key_path=$(echo "$key_path" | tr -d '\r' | tr -d ' ')
+            if [[ -f "$key_path" ]]; then break; else red " [错误] 文件不存在，请重新输入！"; fi
+        done
+        while true; do
+            echo -en " ${LIGHT_YELLOW} ▶ 请输入对应的域名: ${PLAIN}"
+            read domain
+            domain=$(echo "$domain" | tr -d '\r' | tr -d ' ')
+            if [[ -n "$domain" ]]; then break; else red " [错误] 域名不能为空！"; fi
+        done
+        hy_domain="$domain"
+    else
+        echo ""
+        green " 已选择 必应(Bing)自签伪装证书，开始生成密钥与证书..."
+        mkdir -p /etc/hysteria
+        cert_path="/etc/hysteria/cert.crt"
+        key_path="/etc/hysteria/private.key"
+        
+        openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
+        openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
+        chmod 644 /etc/hysteria/cert.crt; chmod 600 /etc/hysteria/private.key
+
+        hy_domain="www.bing.com"
+        domain="www.bing.com"
+    fi
+}
+
+inst_port() {
+    # 修复：防止连续执行菜单时旧的跳跃端口状态残留
+    firstport=""
+    endport=""
+
+    echo ""
+    print_line
+    echo -en " ${LIGHT_YELLOW} ▶ 设置 Hysteria 2 主端口 [10000-65535] (回车随机): ${PLAIN}"
+    read port
+    [[ -z $port ]] && port=$(shuf -i 10000-65535 -n 1)
+    
+    while [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; do
+        red " [警告] 端口必须是 1-65535 之间的纯数字！"
+        echo -en " ${LIGHT_YELLOW} ▶ 重新设置主端口: ${PLAIN}"
+        read port
+        [[ -z $port ]] && port=$(shuf -i 10000-65535 -n 1)
+    done
+
+    while ss -unl | grep -E -q ":$port( |$)"; do
+        red " [警告] 端口 $port 已被占用！"
+        echo -en " ${LIGHT_YELLOW} ▶ 重新设置主端口: ${PLAIN}"
+        read port
+        [[ -z $port ]] && port=$(shuf -i 10000-65535 -n 1)
+    done
+    green " 节点主端口已设置为: $port"
+    open_port $port "udp"
+
+    echo ""
+    yellow "  端口模式选择："
+    echo -e "    ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}单端口直连 (默认)${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_PURPLE}端口跳跃模式 (防封锁黑科技)${PLAIN}"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [1-2] (默认1): ${PLAIN}"
+    read jumpInput
+    if [[ $jumpInput == 2 ]]; then
+        echo ""
+        echo -en " ${LIGHT_YELLOW} ▶ 请输入起始端口 (建议10000-65535): ${PLAIN}"
+        read firstport
+        while [[ ! "$firstport" =~ ^[0-9]+$ ]] || [[ "$firstport" -lt 1 ]] || [[ "$firstport" -gt 65535 ]]; do
+            red " [警告] 起始端口必须是数字！"
+            echo -en " ${LIGHT_YELLOW} ▶ 重新输入起始端口: ${PLAIN}"
+            read firstport
+        done
+
+        echo -en " ${LIGHT_YELLOW} ▶ 请输入末尾端口 (必须大于起始端口): ${PLAIN}"
+        read endport
+        while [[ ! "$endport" =~ ^[0-9]+$ ]] || [[ "$endport" -le "$firstport" ]] || [[ "$endport" -gt 65535 ]]; do
+            red " [警告] 末尾端口无效！"
+            echo -en " ${LIGHT_YELLOW} ▶ 重新输入末尾端口: ${PLAIN}"
+            read endport
+        done
+        green " 已开启端口跳跃范围: $firstport - $endport"
+
+        echo "$firstport:$endport" > /etc/hysteria/port_hop.txt
+
+        modprobe ip6table_nat 2>/dev/null || true
+        # 修复：为 INPUT 链也加上带注释的防火墙规则，确保能被精准删除
+        iptables -I INPUT -p udp --dport $firstport:$endport -m comment --comment "hy2-port-hop-input" -j ACCEPT 2>/dev/null
+        ip6tables -I INPUT -p udp --dport $firstport:$endport -m comment --comment "hy2-port-hop-input" -j ACCEPT 2>/dev/null
+        
+        iptables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j REDIRECT --to-ports $port -m comment --comment "hy2-port-hop" 2>/dev/null
+        ip6tables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j REDIRECT --to-ports $port -m comment --comment "hy2-port-hop" 2>/dev/null
+        
+        # 兼容 IPv6 NAT 缺失的系统
+        if [[ $? -ne 0 ]]; then
+            yellow "  [提示] 当前系统/内核可能不支持 IPv6 NAT，IPv6 端口跳跃已静默跳过。"
+        fi
+
+        if command -v ufw >/dev/null; then ufw allow $firstport:$endport/udp 2>/dev/null; fi
+        if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+            firewall-cmd --zone=public --add-port=$firstport-$endport/udp --permanent 2>/dev/null
+            firewall-cmd --reload 2>/dev/null
+        fi
+        save_iptables
+    fi
+}
+
+inst_sub_port(){
+    echo ""
+    print_line
+    echo -en " ${LIGHT_YELLOW} ▶ 设置智能订阅服务端口 [1024-65535] (回车随机): ${PLAIN}"
+    read sub_port_input
+    [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-30000 -n 1)
+    
+    # 修复：增加了对主端口的防冲突检验
+    while [[ ! "$sub_port_input" =~ ^[0-9]+$ ]] || [[ "$sub_port_input" -lt 1024 ]] || [[ "$sub_port_input" -gt 65535 ]] || [[ "$sub_port_input" == "$port" ]] || { [[ -n "$firstport" && -n "$endport" ]] && [[ "$sub_port_input" -ge "$firstport" && "$sub_port_input" -le "$endport" ]]; }; do
+        if [[ "$sub_port_input" == "$port" ]]; then
+            red " [警告] 订阅端口不能与 Hysteria 主端口 ($port) 冲突！"
+        elif [[ -n "$firstport" && -n "$endport" && "$sub_port_input" -ge "$firstport" && "$sub_port_input" -le "$endport" ]]; then
+            red " [警告] 订阅端口不能与跳跃端口范围 ($firstport-$endport) 重叠冲突！"
+        else
+            red " [警告] 端口必须在 1024-65535 之间！"
+        fi
+        echo -en " ${LIGHT_YELLOW} ▶ 重新设置订阅端口: ${PLAIN}"
+        read sub_port_input
+        [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-30000 -n 1)
+    done
+    
+    while ss -tnl | grep -E -q ":$sub_port_input( |$)"; do
+        red " [警告] 端口 $sub_port_input 已被占用！"
+        echo -en " ${LIGHT_YELLOW} ▶ 重新设置订阅端口: ${PLAIN}"
+        read sub_port_input
+        [[ -z $sub_port_input ]] && sub_port_input=$(shuf -i 10000-30000 -n 1)
+    done
+    green " 订阅端口已设置为: $sub_port_input"
+    open_port $sub_port_input "tcp"
+    
+    mkdir -p /etc/hysteria
+    echo "$sub_port_input" > /etc/hysteria/sub_port.txt
+}
+
+inst_other_configs() {
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 设置节点连接密码 (回车自动生成): ${PLAIN}"
+    read auth_pwd
+    [[ -z $auth_pwd ]] && auth_pwd=$(gen_random_str 8)
+    green " 连接密码为: $auth_pwd"
+
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 伪装网站地址 (不带 https://) [回车默认 www.bing.com]: ${PLAIN}"
+    read proxysite
+    [[ -z $proxysite ]] && proxysite="www.bing.com"
+
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 节点显示名称 [回车默认 Hysteria2_Node]: ${PLAIN}"
+    read custom_node_name
+    [[ -z $custom_node_name ]] && custom_node_name="Hysteria2_Node"
+    
+    # 修复：增加防阻断下的证书跳过选项
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 是否在客户端配置中强制开启 '跳过证书验证' (防 SNI 阻断/高墙推荐)？(y/n) [默认: y]: ${PLAIN}"
+    read force_skip_cert
+    [[ -z $force_skip_cert ]] && force_skip_cert="y"
+    if [[ "$force_skip_cert" == "y" || "$force_skip_cert" == "Y" ]]; then
+        echo "1" > /etc/hysteria/force_skip_cert.txt
+    else
+        echo "0" > /etc/hysteria/force_skip_cert.txt
+    fi
+
+    echo ""
+    print_line
+    yellow "  拥塞控制配置 (降低延迟的核心)"
+    purple "  输入 0 将关闭 Brutal 算法并开启 BBR 回退自适应模式 (适合弱网或未知环境)"
+    purple "  【优化提示】服务端已配置防滥用机制，将强制接管带宽上限！"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入 VPS 最大上行带宽 (Mbps, 输入 0 开启 BBR 自适应模式): ${PLAIN}"
+    read bw_up_input
+    [[ -z $bw_up_input ]] && bw_up_input="0"
+    while [[ ! "$bw_up_input" =~ ^[0-9]+$ ]]; do
+        red " [警告] 仅限纯数字！"
+        echo -en " ${LIGHT_YELLOW} ▶ 重新输入上行带宽 (Mbps): ${PLAIN}"
+        read bw_up_input
+    done
+    
+    if [[ "$bw_up_input" != "0" ]]; then
+        bw_up="${bw_up_input} mbps"
+        echo -en " ${LIGHT_YELLOW} ▶ 请输入 VPS 最大下行带宽 (Mbps, 回车默认 1000): ${PLAIN}"
+        read bw_down_input
+        [[ -z $bw_down_input ]] && bw_down_input="1000"
+        while [[ ! "$bw_down_input" =~ ^[0-9]+$ ]]; do
+            red " [警告] 仅限纯数字！"
+            echo -en " ${LIGHT_YELLOW} ▶ 重新输入下行带宽 (Mbps): ${PLAIN}"
+            read bw_down_input
+        done
+        bw_down="${bw_down_input} mbps"
+        
+        echo ""
+        purple "  为生成最佳的客户端配置，请填写您本地网络（家庭/公司）的实际宽带速度："
+        echo -en " ${LIGHT_YELLOW} ▶ 本地真实下载速度 (Mbps, 回车默认 500): ${PLAIN}"
+        read c_down
+        [[ -z $c_down ]] && c_down="500"
+        echo -en " ${LIGHT_YELLOW} ▶ 本地真实上传速度 (Mbps, 回车默认 50): ${PLAIN}"
+        read c_up
+        [[ -z $c_up ]] && c_up="50"
+        echo "$c_down" > /etc/hysteria/c_down.txt
+        echo "$c_up" > /etc/hysteria/c_up.txt
+    else
+        green " 已开启 BBR 自适应回退模式！"
+        echo "0" > /etc/hysteria/c_down.txt
+        echo "0" > /etc/hysteria/c_up.txt
+    fi
+
+    echo ""
+    print_line
+    yellow "  防阻断混淆(Obfuscation)配置"
+    purple "  开启 Salamander 混淆可防运营商 QoS 限速与封锁。"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 是否开启混淆？(y/n) [默认: y]: ${PLAIN}"
+    read enable_obfs
+    [[ -z $enable_obfs ]] && enable_obfs="y"
+    if [[ "$enable_obfs" == "y" || "$enable_obfs" == "Y" ]]; then
+        obfs_pwd=$(gen_random_str 12)
+        green " 已开启混淆，系统生成的密钥为: $obfs_pwd"
+    else
+        obfs_pwd=""
+        yellow " 已跳过混淆配置。"
+    fi
+}
+
+# =================================================================
+#  6. 核心业务处理与部署逻辑
+# =================================================================
+clean_env() {
+    local mode="$1"
+    
+    local main_port=$(grep -E "^[[:space:]]*listen:" /etc/hysteria/config.yaml 2>/dev/null | awk -F ':' '{print $NF}' | tr -d ' ' | tr -d '\r' | tr -d '"')
+    local sub_port=$(cat /etc/hysteria/sub_port.txt 2>/dev/null | tr -d '\r')
+
+    [[ -n "$main_port" && "$main_port" =~ ^[0-9]+$ ]] && close_port "$main_port" "udp"
+    [[ -n "$sub_port" && "$sub_port" =~ ^[0-9]+$ ]] && close_port "$sub_port" "tcp"
+
+    # 精准清除跳跃端口残留的 NAT 和 INPUT 规则
+    if command -v iptables >/dev/null; then
+        iptables -t nat -nL PREROUTING --line-numbers 2>/dev/null | grep "hy2-port-hop" | awk '{print $1}' | sort -nr | while read -r num; do
+            iptables -t nat -D PREROUTING "$num" 2>/dev/null
+        done
+        iptables -nL INPUT --line-numbers 2>/dev/null | grep "hy2-port-hop-input" | awk '{print $1}' | sort -nr | while read -r num; do
+            iptables -D INPUT "$num" 2>/dev/null
+        done
+    fi
+    if command -v ip6tables >/dev/null; then
+        ip6tables -t nat -nL PREROUTING --line-numbers 2>/dev/null | grep "hy2-port-hop" | awk '{print $1}' | sort -nr | while read -r num; do
+            ip6tables -t nat -D PREROUTING "$num" 2>/dev/null
+        done
+        ip6tables -nL INPUT --line-numbers 2>/dev/null | grep "hy2-port-hop-input" | awk '{print $1}' | sort -nr | while read -r num; do
+            ip6tables -D INPUT "$num" 2>/dev/null
+        done
+    fi
+
+    if [[ -f /etc/hysteria/port_hop.txt ]]; then
+        local hop_range=$(cat /etc/hysteria/port_hop.txt | tr -d '\r')
+        local f_port=$(echo "$hop_range" | cut -d':' -f1)
+        local e_port=$(echo "$hop_range" | cut -d':' -f2)
+        if [[ -n "$f_port" && -n "$e_port" ]]; then
+            if command -v ufw >/dev/null; then ufw delete allow "$f_port:$e_port/udp" 2>/dev/null; fi
+            if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+                firewall-cmd --zone=public --remove-port="$f_port-$e_port/udp" --permanent 2>/dev/null
+                firewall-cmd --reload 2>/dev/null
+            fi
+        fi
+    fi
+
+    svc_stop hysteria-server 2>/dev/null; svc_disable hysteria-server 2>/dev/null
+    svc_stop hysteria-sub 2>/dev/null; svc_disable hysteria-sub 2>/dev/null
+    
+    # 修复：准确定位，绝不误杀用户的其他 server.py 进程
+    pkill -f "/var/www/hysteria/server.py" 2>/dev/null || true
+
+    if [[ $SYSTEM == "Alpine" ]]; then
+        rm -f /etc/init.d/hysteria-server /etc/init.d/hysteria-sub
+    else
+        rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-sub.service
+        systemctl daemon-reload 2>/dev/null
+    fi
+    save_iptables
+
+    rm -rf /usr/local/bin/hysteria /etc/hysteria /var/www/hysteria
+    
+    if [[ "$mode" == "all" ]]; then
+        rm -f /root/cert.crt /root/private.key /root/ca.log
+        rm -rf /root/.acme.sh
+        echo ""
+        green "  [提示] 证书及 Acme.sh 环境已彻底清除。"
+    elif [[ "$mode" == "keep" ]]; then
+        echo ""
+        yellow "  [提示] Acme.sh 环境及已申请的证书被保留，未执行全局卸载。"
+    fi
+}
+
 generate_client_configs() {
     realip
-    local cfg="/usr/local/etc/sing-box/config.json"
     
-    local uuid=$(jq -r '.inbounds[0].users[0].uuid' $cfg)
-    local port=$(jq -r '.inbounds[0].listen_port' $cfg)
-    local domain=$(jq -r '.inbounds[0].tls.server_name' $cfg)
-    local node_name=$(cat /usr/local/etc/sing-box/node_name.meta 2>/dev/null || echo "VLESS_Node")
-    local safe_node_name=$(NAME="$node_name" python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ.get('NAME', '')))")
+    # 稳健的密码提取，剥离双引号
+    local raw_pwd=$(awk '/^auth:/,0' /etc/hysteria/config.yaml | grep -E '^[[:space:]]*password:' | head -n 1 | sed 's/.*password:[[:space:]]*//; s/["'\''\r]//g')
     
-    local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
-    local is_ws=$(jq -r '.inbounds[0].transport.type // "tcp"' $cfg)
+    # 彻底的 URL Safe 编码处理 (避免特殊字符断裂 URI)
+    local s_pwd=$(PWD="$raw_pwd" python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ.get('PWD', '')))")
+    local safe_node_name=$(NAME="$custom_node_name" python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ.get('NAME', '')))")
     
-    local flow=$(jq -r '.inbounds[0].users[0].flow // empty' $cfg)
-    local flow_url=""
-    local clash_flow=""
-    if [[ -n "$flow" && "$flow" != "null" ]]; then
-        flow_url="&flow=${flow}"
-        clash_flow="\n    flow: ${flow}"
-    fi
+    local c_domain=$(grep 'sni:' /etc/hysteria/hy-client.yaml | awk '{print $2}')
+    [[ -z "$c_domain" ]] && c_domain="www.bing.com"
     
-    local url=""
-    local clash_proxy_yaml=""
-    local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
-
-    if [[ "$is_reality" == "true" ]]; then
-        local pbk=$(cat /usr/local/etc/sing-box/public_key.meta 2>/dev/null)
-        local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)
-        url="vless://${uuid}@${uri_ip}:${port}?encryption=none${flow_url}&security=reality&sni=${domain}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${uri_ip}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true${clash_flow}\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: \"${pbk}\"\n      short-id: \"${sid}\""
-
-    elif [[ "$is_ws" == "ws" ]]; then
-        local ws_path=$(jq -r '.inbounds[0].transport.path' $cfg)
-        url="vless://${uuid}@${domain}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&path=${ws_path}&host=${domain}#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: ws\n    tls: true\n    udp: true\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    ws-opts:\n      path: \"${ws_path}\"\n      headers:\n        Host: \"${domain}\""
-        
+    local c_server=$(grep '^server:' /etc/hysteria/hy-client.yaml | awk '{print $2}')
+    local c_ports="${c_server##*:}"
+    local primary_port=$(echo "$c_ports" | cut -d',' -f1)
+    local hop_ports=$(echo "$c_ports" | awk -F ',' '{print $2}')
+    
+    local s_obfs_pwd=$(awk '/obfs:/{flag=1} flag && /password:/{print $2; flag=0}' /etc/hysteria/config.yaml | tr -d '"' | tr -d "'")
+    local is_insecure_url=$(cat /etc/hysteria/insecure_state.txt || echo "1")
+    local force_skip=$(cat /etc/hysteria/force_skip_cert.txt 2>/dev/null || echo "1")
+    
+    local clash_cert_verify="false"
+    
+    if [[ "$is_insecure_url" == "0" && "$force_skip" == "0" ]]; then
+        clash_cert_verify="false"
+        echo "$c_domain" > /etc/hysteria/sub_host.txt
     else
-        url="vless://${uuid}@${domain}:${port}?encryption=none${flow_url}&security=tls&sni=${domain}&fp=chrome&type=tcp&headerType=none#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true${clash_flow}\n    servername: \"${domain}\"\n    client-fingerprint: chrome"
+        clash_cert_verify="true"
+        echo "$ip" > /etc/hysteria/sub_host.txt
     fi
 
-    local web_dir="/var/www/vless"
-    local sub_uuid=$(cat /usr/local/etc/sing-box/sub_path.meta 2>/dev/null)
-    [[ -z "$sub_uuid" ]] && sub_uuid=$(gen_random_str 16) && echo "$sub_uuid" > /usr/local/etc/sing-box/sub_path.meta
+    local obfs_param=""
+    if [[ -n "$s_obfs_pwd" ]]; then
+        obfs_param="&obfs=salamander&obfs-password=${s_obfs_pwd}"
+    fi
+
+    local c_up=$(cat /etc/hysteria/c_up.txt || echo "0")
+    local c_down=$(cat /etc/hysteria/c_down.txt || echo "0")
+
+    local yaml_json_ip="$ip"
+    local uri_ip="$ip"
     
+    if [[ "$ip" == *":"* ]]; then
+        uri_ip="[$ip]"
+    fi
+
+    local mport_param=""
+    if [[ -n "$hop_ports" ]]; then
+        mport_param="&mport=$hop_ports"
+    fi
+
+    local web_dir="/var/www/hysteria"
+    mkdir -p "$web_dir"
+
+    local sub_uuid=$(gen_random_str 16)
     mkdir -p "$web_dir/$sub_uuid"
+    echo "$sub_uuid" > /etc/hysteria/sub_path.txt
+
+    local url="hy2://$s_pwd@$uri_ip:$primary_port/?insecure=${is_insecure_url}&sni=$c_domain${mport_param}${obfs_param}#${safe_node_name}"
     echo "$url" > "$web_dir/$sub_uuid/url.txt"
+    
+    # Base64 去换行符保险策略
     printf "%s" "$url" | base64 -w 0 2>/dev/null > "$web_dir/$sub_uuid/sub_b64.txt" || printf "%s" "$url" | base64 | tr -d '\r\n' > "$web_dir/$sub_uuid/sub_b64.txt"
 
     cat << EOF > "$web_dir/$sub_uuid/clash-meta-sub.yaml"
@@ -415,50 +719,89 @@ allow-lan: true
 mode: rule
 log-level: info
 ipv6: true
+
 proxies:
-$(echo -e "$clash_proxy_yaml")
+  - name: '${custom_node_name}'
+    type: hysteria2
+    server: "$yaml_json_ip"
+    port: $primary_port
+$([[ -n "$hop_ports" ]] && echo "    ports: '$hop_ports'")
+    password: "$raw_pwd"
+    sni: "$c_domain"
+    skip-cert-verify: $clash_cert_verify
+    alpn:
+      - h3
+$([[ -n "$s_obfs_pwd" ]] && echo "    obfs: salamander
+    obfs-password: \"$s_obfs_pwd\"")
+$([[ "$c_up" != "0" ]] && echo "    up: '${c_up} mbps'
+    down: '${c_down} mbps'")
+
 proxy-groups:
   - name: "节点选择"
     type: select
     proxies:
-      - '${node_name}'
+      - '${custom_node_name}'
       - DIRECT
+
 rules:
   - GEOIP,LAN,DIRECT,no-resolve
   - GEOIP,CN,DIRECT
   - MATCH,节点选择
 EOF
 
-    chown -R root:root "$web_dir"
-    find "$web_dir" -type d -exec chmod 755 {} +
-    find "$web_dir" -type f -exec chmod 644 {} +
-
-    local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
+    local sub_port=$(cat /etc/hysteria/sub_port.txt)
+    local sub_cert_dir="$web_dir/certs"
+    mkdir -p "$sub_cert_dir"
     
-    cat << EOF > "$web_dir/vless_server.py"
-import http.server, socketserver, urllib.parse, socket, os
+    cp -L "$cert_path" "$sub_cert_dir/cert.crt" || cp -L /etc/hysteria/cert.crt "$sub_cert_dir/cert.crt"
+    cp -L "$key_path" "$sub_cert_dir/private.key" || cp -L /etc/hysteria/private.key "$sub_cert_dir/private.key"
+    
+    chown -R nobody "$sub_cert_dir"
+    chmod 400 "$sub_cert_dir/private.key"
+    
+    # 多线程防阻塞的 ThreadingTCPServer
+    cat << EOF > "$web_dir/server.py"
+import http.server
+import socketserver
+import ssl
+import os
+import urllib.parse
+import socket
+
 PORT = $sub_port
 SUB_UUID = "$sub_uuid"
+CERT_FILE = "$sub_cert_dir/cert.crt"
+KEY_FILE = "$sub_cert_dir/private.key"
+
+try:
+    with open("$web_dir/$sub_uuid/clash-meta-sub.yaml", 'rb') as f:
+        CLASH_DATA = f.read()
+    with open("$web_dir/$sub_uuid/sub_b64.txt", 'rb') as f:
+        B64_DATA = f.read()
+except FileNotFoundError:
+    CLASH_DATA = b""
+    B64_DATA = b""
 
 class SecureSubHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "nginx/1.24.0"; sys_version = ""
+    server_version = "nginx/1.24.0"
+    sys_version = ""
+
     def do_GET(self):
-        req_path = urllib.parse.urlparse(self.path).path.strip('/')
+        parsed = urllib.parse.urlparse(self.path)
+        req_path = parsed.path.strip('/')
+        
         if req_path == SUB_UUID:
             self.send_response(200)
             self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            self.send_header('profile-update-interval', '24')
             self.end_headers()
             
-            try:
-                with open("$web_dir/$sub_uuid/clash-meta-sub.yaml", 'rb') as f: clash_data = f.read()
-                with open("$web_dir/$sub_uuid/sub_b64.txt", 'rb') as f: b64_data = f.read()
-            except FileNotFoundError:
-                clash_data = b""; b64_data = b""
-
             ua = self.headers.get('User-Agent', '').lower()
-            if any(x in ua for x in ['clash', 'meta', 'verge', 'stash', 'mihomo']): self.wfile.write(clash_data)
-            else: self.wfile.write(b64_data + b"\n")
+            if any(x in ua for x in ['clash', 'meta', 'verge', 'stash', 'mihomo']):
+                self.wfile.write(CLASH_DATA)
+            else:
+                self.wfile.write(B64_DATA + b"\n")
         else:
             self.send_response(403)
             self.send_header('Content-type', 'text/html; charset=utf-8')
@@ -466,453 +809,1012 @@ class SecureSubHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"<html><head><title>403 Forbidden</title></head><body><center><h1>403 Forbidden</h1></center><hr><center>nginx</center></body></html>")
 
 class DualStackServer(socketserver.ThreadingTCPServer):
-    daemon_threads = True; allow_reuse_address = True
+    daemon_threads = True
+    allow_reuse_address = True
     address_family = getattr(socket, 'AF_INET6', socket.AF_INET)
+
     def server_bind(self):
         if hasattr(socket, 'AF_INET6') and self.address_family == socket.AF_INET6:
-            try: self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            except: pass
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
         super().server_bind()
 
-try: httpd = DualStackServer(("", PORT), SecureSubHandler)
+try:
+    httpd = DualStackServer(("", PORT), SecureSubHandler)
 except OSError:
     DualStackServer.address_family = socket.AF_INET
     httpd = DualStackServer(("0.0.0.0", PORT), SecureSubHandler)
+
+if "${is_insecure_url}" == "0" and os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    except AttributeError:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+    context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+
 httpd.serve_forever()
 EOF
 
+    chown -R nobody "$web_dir"
+    
     local py_path=$(command -v python3)
     if [[ $SYSTEM == "Alpine" ]]; then
-        cat << EOF > /etc/init.d/vless-sub
+        cat << EOF > /etc/init.d/hysteria-sub
 #!/sbin/openrc-run
-description="VLESS Subscription Server"
+description="Hysteria Subscription Server"
 command="${py_path}"
-command_args="${web_dir}/vless_server.py"
+command_args="${web_dir}/server.py"
 command_background=true
 command_user="nobody"
 directory="${web_dir}"
-pidfile="/run/vless-sub.pid"
+pidfile="/run/hysteria-sub.pid"
 EOF
-        chmod +x /etc/init.d/vless-sub; rc-update add vless-sub default
+        chmod +x /etc/init.d/hysteria-sub
+        rc-update add hysteria-sub default
     else
-        cat << EOF > /etc/systemd/system/vless-sub.service
+        cat << EOF > /etc/systemd/system/hysteria-sub.service
 [Unit]
-Description=VLESS Subscription Server
+Description=Hysteria Subscription Server
 After=network.target
+
 [Service]
 Type=simple
 User=nobody
 WorkingDirectory=${web_dir}
-ExecStart=${py_path} ${web_dir}/vless_server.py
+ExecStart=${py_path} ${web_dir}/server.py
 Restart=always
 RestartSec=3
+
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload; systemctl enable vless-sub >/dev/null 2>&1
+        systemctl daemon-reload
+        systemctl enable hysteria-sub
     fi
-    if [[ $SYSTEM == "Alpine" ]]; then rc-service vless-sub restart >/dev/null 2>&1; else systemctl restart vless-sub >/dev/null 2>&1; fi
+    
+    svc_stop hysteria-sub 2>/dev/null
+    svc_start hysteria-sub
 }
 
-inst_proxy_core() {
-    check_env; inst_singbox_core; generate_singbox_config
-
+insthysteria() {
+    if [[ -f "/etc/hysteria/config.yaml" || -f "/usr/local/bin/hysteria" ]]; then
+        echo ""
+        yellow "  检测到旧版本配置，正在清理旧规则与文件，为您重新生成..."
+        clean_env "keep_certs"
+        green "  旧文件清理完成，准备重新部署！"
+    fi
+    
+    check_env
+    mkdir -p /etc/hysteria
+    
+    api_port=$(shuf -i 30000-60000 -n 1)
+    while ss -tnl | grep -E -q ":$api_port( |$)"; do api_port=$(shuf -i 30000-60000 -n 1); done
+    echo "$api_port" > /etc/hysteria/api_port.txt
+    
+    echo ""
+    print_line
+    yellow "  正在下载 Hysteria 2 二进制核心..."
+    arch=$(uname -m)
+    case $arch in
+        x86_64) hy_arch="amd64" ;;
+        aarch64) hy_arch="arm64" ;;
+        s390x) hy_arch="s390x" ;;
+        *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
+    esac
+    
+    wget --timeout=10 --tries=3 -N -v -O /usr/local/bin/hysteria "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${hy_arch}"
+    
+    if [[ ! -s /usr/local/bin/hysteria ]]; then
+        red " [错误] Hysteria 2 核心下载失败或文件损坏，请根据上方输出排查网络！"
+        rm -f /usr/local/bin/hysteria
+        exit 1
+    fi
+    
+    chmod +x /usr/local/bin/hysteria
+    green "  核心下载完成！"
+    
     if [[ $SYSTEM == "Alpine" ]]; then
-        cat << 'EOF' > /etc/init.d/sing-box
+        cat << 'EOF' > /etc/init.d/hysteria-server
 #!/sbin/openrc-run
-description="sing-box Service"
-command="/usr/local/bin/sing-box"
-command_args="run -c /usr/local/etc/sing-box/config.json"
+description="Hysteria 2 Server"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
 command_background=true
-pidfile="/run/sing-box.pid"
+pidfile="/run/hysteria-server.pid"
 rc_ulimit="-n 1048576"
 EOF
-        chmod +x /etc/init.d/sing-box; rc-update add sing-box default; rc-service sing-box restart
+        chmod +x /etc/init.d/hysteria-server
     else
-        cat << EOF > /etc/systemd/system/sing-box.service
+        cat << EOF > /etc/systemd/system/hysteria-server.service
 [Unit]
-Description=sing-box Service
-Documentation=https://sing-box.sagernet.org/
-After=network.target nss-lookup.target
+Description=Hysteria 2 Server
+After=network.target
+
 [Service]
+Type=simple
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
+WorkingDirectory=/etc/hysteria
+LimitNOFILE=1048576
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=always
+RestartSec=3
+
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload; systemctl enable sing-box >/dev/null 2>&1; systemctl restart sing-box
+        systemctl daemon-reload
     fi
 
-    generate_client_configs
-    echo ""; print_line; green "  VLESS 多模式节点及智能订阅部署完成！"; purple "  请在主菜单选择 [6] 获取节点配置。"; echo ""; sleep 3
-}
+    inst_cert
+    inst_port
+    inst_sub_port
+    inst_other_configs
 
-inst_mode_menu() {
-    clear; echo ""; print_line; green "                   选择 VLESS 核心网络模式                  "; print_line; echo ""
-    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}VLESS + TCP + Reality (强烈推荐)${PLAIN}"
-    echo -e "      ${LIGHT_PURPLE}↳ 特性:${PLAIN} 免域名 / 防御主动探测极佳 / 适合所有 VPS"
-    echo ""
-    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_YELLOW}VLESS + TCP + TLS (经典直连)${PLAIN}"
-    echo -e "      ${LIGHT_PURPLE}↳ 特性:${PLAIN} 需自备域名 / 全站真实伪装 / 自动申请证书"
-    echo ""
-    echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_RED}VLESS + WS + TLS (CDN 救星)${PLAIN}"
-    echo -e "      ${LIGHT_PURPLE}↳ 特性:${PLAIN} 需自备域名 / 支持 Cloudflare / 拯救被墙 IP"
-    echo ""; print_line; echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}返回主菜单${PLAIN}"; print_line; echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请选择安装模式 [0-3]: ${PLAIN}"; read modeInput
-    case $modeInput in
-        1) INSTALL_MODE=1; collect_reality_info; inst_proxy_core ;;
-        2) INSTALL_MODE=2; collect_tls_info; inst_proxy_core ;;
-        3) INSTALL_MODE=3; collect_ws_info; inst_proxy_core ;;
-        0) return ;;
-        *) red "  无效选择！"; sleep 1; inst_mode_menu ;;
-    esac
-}
-
-clean_env() {
-    local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ -f $cfg ]]; then
-        local port=$(jq -r '.inbounds[0].listen_port // empty' $cfg)
-        [[ -n "$port" ]] && close_port "$port"
-    fi
-    local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta 2>/dev/null)
-    [[ -n "$sub_port" ]] && close_port "$sub_port"
-
-    if [[ $SYSTEM == "Alpine" ]]; then
-        rc-service sing-box stop 2>/dev/null; rc-update del sing-box default 2>/dev/null
-        rc-service vless-sub stop 2>/dev/null; rc-update del vless-sub default 2>/dev/null
-        rm -f /etc/init.d/sing-box /etc/init.d/vless-sub
+    # 修复：读取用户在 inst_other_configs 里的手动选择
+    local user_force_skip=$(cat /etc/hysteria/force_skip_cert.txt 2>/dev/null || echo "0")
+    if [[ "$hy_domain" == "www.bing.com" || "$user_force_skip" == "1" ]]; then
+        cert_insecure_yaml="true"
+        cert_insecure_url="1"
     else
-        systemctl stop sing-box vless-sub 2>/dev/null
-        systemctl disable sing-box vless-sub 2>/dev/null
-        rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/vless-sub.service
-        systemctl daemon-reload 2>/dev/null
+        cert_insecure_yaml="false"
+        cert_insecure_url="0"
     fi
-    pkill -f "vless_server.py" 2>/dev/null || true
-    rm -rf /usr/local/bin/sing-box /usr/local/etc/sing-box /var/www/vless
-}
+    echo "$cert_insecure_url" > /etc/hysteria/insecure_state.txt
 
-proxy_switch() {
-    clear; echo ""; print_line; green "                      服务运行状态控制                     "; print_line; echo ""
-    echo -e "    ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}启动 服务${PLAIN}"
-    echo -e "    ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_RED}停止 服务${PLAIN}"
-    echo -e "    ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}重启 服务${PLAIN}"
-    echo ""; echo -e "    ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_PURPLE}返回主菜单${PLAIN}"; echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [0-3]: ${PLAIN}"; read switchInput
-    case $switchInput in
-        1) if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box start >/dev/null 2>&1; rc-service vless-sub start >/dev/null 2>&1; else systemctl start sing-box vless-sub >/dev/null 2>&1; fi; green "  启动成功"; sleep 1 ;;
-        2) if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box stop >/dev/null 2>&1; rc-service vless-sub stop >/dev/null 2>&1; else systemctl stop sing-box vless-sub >/dev/null 2>&1; fi; pkill -f "vless_server.py" 2>/dev/null; yellow "  已停止"; sleep 1 ;;
-        3) if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; rc-service vless-sub restart >/dev/null 2>&1; else systemctl restart sing-box vless-sub >/dev/null 2>&1; fi; green "  重启成功"; sleep 1 ;;
-        0) return ;;
-        *) red "  输入无效"; sleep 1 ;;
-    esac
-}
+    cat << EOF > /etc/hysteria/config.yaml
+listen: :$port
 
-edit_config() {
-    clear; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
-    echo ""; print_line; green "                  当前核心 JSON 配置                   "; print_line; echo ""
-    cat $cfg; echo ""; print_line
-    echo -en " ${LIGHT_YELLOW} ▶ 是否手动修改配置文件？(y/n) [默认: n]: ${PLAIN}"; read edit_choice
-    if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
-        cp $cfg /tmp/config_backup.json
-        if command -v nano >/dev/null; then nano $cfg; else vi $cfg; fi
-        yellow "  正在校验语法..."
-        if ! /usr/local/bin/sing-box check -c $cfg >/dev/null 2>&1; then
-            red "  [错误] 语法错误！已回滚配置。"; mv /tmp/config_backup.json $cfg
-        else
-            green "  语法通过，正在重启同步..."; rm -f /tmp/config_backup.json
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  重启同步完成！"
-        fi
-    fi
-    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
-}
+tls:
+  cert: $cert_path
+  key: $key_path
 
-modify_sni() {
-    clear; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
-    local old_sni=$(jq -r '.inbounds[0].tls.server_name' $cfg)
-    echo ""; print_line; green "                  修改伪装域名 (SNI / 真实域名)              "; print_line; echo ""
-    yellow "  当前配置的域名: $old_sni"; echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请输入新的域名 (留空取消): ${PLAIN}"; read new_sni
-    if [[ -n "$new_sni" && "$new_sni" != "$old_sni" ]]; then
-        local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
-        if [[ "$is_reality" == "true" ]]; then
-            jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' $cfg > /tmp/sb_tmp.json
-        else
-            jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.acme.domain[0] = $sni | .inbounds[0].tls.acme.default_server_name = $sni | .inbounds[0].tls.acme.email = "admin@" + $sni' $cfg > /tmp/sb_tmp.json
-        fi
-        if [ -s /tmp/sb_tmp.json ]; then
-            mv -f /tmp/sb_tmp.json $cfg
-            green "  已更新域名为 $new_sni，正在重启并同步订阅..."
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  更新完成！"
-        else
-            red "  [错误] 配置文件解析失败！"
-        fi
-    else
-        yellow "  操作已取消。"
-    fi
-    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
-}
+auth:
+  type: password
+  password: $auth_pwd
 
-showconf() {
-    realip; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置，请先安装！"; sleep 2; return; fi
-    local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
-    local sub_path=$(cat /usr/local/etc/sing-box/sub_path.meta)
-    local sub_url="http://${ip}:${sub_port}/${sub_path}"
-    [[ "$ip" == *":"* ]] && sub_url="http://[${ip}]:${sub_port}/${sub_path}"
-    local raw_url=$(cat "/var/www/vless/$sub_path/url.txt")
-    
-    clear; echo ""; print_line; green "                VLESS 全平台智能订阅               "; print_line; echo ""
-    yellow "  ▶ [智能订阅链接] (适用 Clash Meta / v2rayN / Shadowrocket)"; green  "    ${sub_url}"; echo ""
-    yellow "  ▶ [单节点直连链接] (适用 NekoBox / v2rayNG 直导)"; green  "    ${raw_url}"; echo ""
-    if command -v qrencode > /dev/null; then echo ""; purple "  提示：若二维码断层，请缩小终端字体"; echo ""; qrencode -t ANSIUTF8 "$raw_url"; else curl -s -d "$raw_url" https://qrenco.de; fi
-    echo ""; print_line; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
-}
+$(if [[ "$bw_up_input" != "0" ]]; then
+echo "bandwidth:
+  up: $bw_up
+  down: $bw_down
+ignoreClientBandwidth: true"
+fi)
 
-# 【优化 5 & 6】住宅 IP 一键 URI 导入，修复 curl HTTPS 代理测试误报
-setup_chain_outbound() {
-    clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
-    local cfg="/usr/local/etc/sing-box/config.json"
-    local tmp_cfg="/tmp/sb_tmp.json"
-    
-    if [[ ! -f $cfg ]]; then red "  [错误] 未检测到配置，请先安装服务！"; sleep 2; return; fi
+$(if [[ -n "$obfs_pwd" ]]; then
+echo "obfs:
+  type: salamander
+  salamander:
+    password: \"$obfs_pwd\""
+fi)
 
-    echo -e "  支持使用标准 URI 格式一键配置落地节点，实现原生 IP 解锁。"
-    echo -e "  支持协议: ${LIGHT_PURPLE}socks5://, http://, https://${PLAIN}"
-    echo -e "  格式示例: ${LIGHT_YELLOW}socks5://username:password@1.2.3.4:1080${PLAIN} (无密码可省去 user:pass@)"
-    echo ""
-    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}一键导入代理 URI (Socks5/HTTP/HTTPS)${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_GREEN}测试当前落地 IP 连通性与归属地 🔍${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}恢复直连 (撤销住宅 IP，恢复 Direct)${PLAIN}"
-    echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请选择操作 [0-2]: ${PLAIN}"; read out_type
+resolver:
+  type: udp
+  udp:
+    addr: 8.8.8.8:53
+    timeout: 4s
 
-    # 0. 恢复直连
-    if [[ "$out_type" == "0" ]]; then
-        jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
-        if [ -s "$tmp_cfg" ]; then
-            mv -f "$tmp_cfg" "$cfg"
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  [✔] 已撤销住宅 IP 落地，恢复为 VPS 全局直连模式 (已重新开启 Vision 加速)！"
-            purple "  💡 重要提示：节点配置已变，请在客户端【更新订阅】！"
-            sleep 3; return
-        else
-            red "  [✘] 配置文件修改失败！"; sleep 2; return
-        fi
-    fi
+acl:
+  inline:
+    - reject(169.254.0.0/16)
+    - reject(::1/128)
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+    - direct(all)
 
-    # 2. 测试连通性
-    if [[ "$out_type" == "2" ]]; then
-        echo ""; print_line
-        local cur_type=$(jq -r '.outbounds[] | select(.tag == "proxy") | .type' "$cfg" 2>/dev/null)
-        local is_tls=$(jq -r '.outbounds[] | select(.tag == "proxy") | .tls.enabled // false' "$cfg" 2>/dev/null)
-        
-        if [[ -z "$cur_type" ]]; then
-            yellow "  当前未配置落地节点 (处于 VPS 直连模式)，无需测试。"
-        else
-            local cur_ip=$(jq -r '.outbounds[] | select(.tag == "proxy") | .server' "$cfg")
-            local cur_port=$(jq -r '.outbounds[] | select(.tag == "proxy") | .server_port' "$cfg")
-            local cur_user=$(jq -r '.outbounds[] | select(.tag == "proxy") | .username // empty' "$cfg")
-            local cur_pass=$(jq -r '.outbounds[] | select(.tag == "proxy") | .password // empty' "$cfg")
-            
-            local proxy_url=""
-            if [[ "$cur_type" == "socks" ]]; then
-                [[ -n "$cur_user" ]] && proxy_url="socks5h://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="socks5h://${cur_ip}:${cur_port}"
-            elif [[ "$cur_type" == "http" ]]; then
-                if [[ "$is_tls" == "true" ]]; then
-                    [[ -n "$cur_user" ]] && proxy_url="https://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="https://${cur_ip}:${cur_port}"
-                else
-                    [[ -n "$cur_user" ]] && proxy_url="http://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="http://${cur_ip}:${cur_port}"
-                fi
-            else
-                red "  当前配置的落地协议 ($cur_type) 不支持快捷测试。"
-                sleep 2; return
-            fi
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$proxysite
+    rewriteHost: true
 
-            yellow "  正在通过代理连接测试网络 (Timeout: 10s)..."
-            local test_ip=$(curl -x "$proxy_url" -sL -m 10 https://api.ipify.org 2>/dev/null)
-            
-            if [[ -n "$test_ip" && "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                green "  [✔] 连通性测试成功！"
-                yellow "  ▶ 代理入口地址: $cur_ip:$cur_port"
-                yellow "  ▶ 实际出口 IP : $test_ip"
-                
-                local ip_info=$(curl -x "$proxy_url" -sL -m 10 "http://ip-api.com/json/$test_ip?lang=zh-CN" 2>/dev/null)
-                local country=$(echo "$ip_info" | jq -r '.country // "未知"')
-                local isp=$(echo "$ip_info" | jq -r '.isp // "未知"')
-                purple "  ▶ 归属地信息  : $country | ISP: $isp"
-            else
-                red "  [✘] 测试失败！无法连接到该代理。"
-                echo -e "      ${LIGHT_PURPLE}排错指南：${PLAIN}"
-                echo "      1. 代理服务器宕机 / 额度耗尽 / IP未加白名单"
-                echo "      2. URI 格式拼写错误 (特别是包含特殊字符的密码)"
-                if [[ "$is_tls" == "true" && "$cur_type" == "http" ]]; then
-                    yellow "      3. ⚠️ 注意: 您开启了 HTTPS 代理，部分旧系统 curl 版本过低可能导致测试误报，可直接到客户端连接测试。"
-                fi
-            fi
-        fi
-        echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
-        return
-    fi
-
-    # 1. 解析 URI 并配置节点
-    if [[ "$out_type" == "1" ]]; then
-        echo -en " ${LIGHT_YELLOW} ▶ 请粘贴代理 URI: ${PLAIN}"; read proxy_uri
-        
-        [[ -z "$proxy_uri" ]] && { red "  [错误] 链接不能为空！操作取消。"; sleep 2; return; }
-
-        local proto=$(echo "$proxy_uri" | awk -F'://' '{print $1}' | tr '[:upper:]' '[:lower:]')
-        local rest=$(echo "$proxy_uri" | awk -F'://' '{print $2}')
-        
-        if [[ -z "$rest" || -z "$proto" ]]; then
-            red "  [错误] 链接格式不正确！请包含协议头 (如 socks5://)。"; sleep 2; return
-        fi
-
-        local out_user="" out_pass="" out_host="" out_port=""
-        if [[ "$rest" == *"@"* ]]; then
-            local cred=$(echo "$rest" | awk -F'@' '{print $1}')
-            local hostport=$(echo "$rest" | awk -F'@' '{print $2}')
-            out_user=$(echo "$cred" | awk -F':' '{print $1}')
-            out_pass=$(echo "$cred" | awk -F':' '{print $2}')
-            out_host=$(echo "$hostport" | awk -F':' '{print $1}')
-            out_port=$(echo "$hostport" | awk -F':' '{print $2}' | tr -d '/')
-        else
-            out_host=$(echo "$rest" | awk -F':' '{print $1}')
-            out_port=$(echo "$rest" | awk -F':' '{print $2}' | tr -d '/')
-        fi
-
-        if [[ -z "$out_host" || -z "$out_port" ]]; then
-            red "  [错误] 无法解析出服务器 IP/域名 或 端口！"; sleep 2; return
-        fi
-
-        local sb_type=""
-        local enable_tls="false"
-
-        if [[ "$proto" == "socks5" || "$proto" == "socks" ]]; then
-            sb_type="socks"
-        elif [[ "$proto" == "http" ]]; then
-            sb_type="http"
-        elif [[ "$proto" == "https" ]]; then
-            sb_type="http"
-            enable_tls="true"
-        else
-            red "  [错误] 不支持的协议: $proto (仅支持 socks5, http, https)"; sleep 2; return
-        fi
-
-        green "  [✔] 解析成功: 协议=${proto}, 地址=${out_host}, 端口=${out_port}, 用户=${out_user:-无}"
-
-        if [[ "$sb_type" == "socks" ]]; then
-            if [[ -n "$out_user" ]]; then
-                jq --arg ip "$out_host" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            else
-                jq --arg ip "$out_host" --arg port "$out_port" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            fi
-        elif [[ "$sb_type" == "http" ]]; then
-            if [[ -n "$out_user" ]]; then
-                jq --arg ip "$out_host" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            else
-                jq --arg ip "$out_host" --arg port "$out_port" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber) }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            fi
-        fi
-
-        if [[ "$enable_tls" == "true" ]]; then
-            jq '.outbounds[0] += {"tls": {"enabled": true}}' "$tmp_cfg" > "${tmp_cfg}.tls"
-            mv -f "${tmp_cfg}.tls" "$tmp_cfg"
-        fi
-
-        echo ""; print_line
-        echo -e "  是否开启【流媒体与 AI 智能分流】？"
-        echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 n (全局走代理)]: ${PLAIN}"; read enable_route
-        
-        if [[ "$enable_route" == "y" || "$enable_route" == "Y" ]]; then
-            local route_json='{
-                "rules": [
-                    { "domain_suffix": [".netflix.com", ".nflxvideo.net", ".nflximg.net", ".openai.com", ".chatgpt.com", ".disneyplus.com", ".dssott.com", ".ipify.org"], "domain_keyword": ["netflix", "openai", "disney"], "outbound": "proxy" }
-                ],
-                "final": "direct"
-            }'
-            jq --argjson route "$route_json" '.route = $route' "$tmp_cfg" > "${tmp_cfg}.2"
-            mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            green "  [✔] 已附加智能分流规则！"
-        else
-            jq '.route = {"final": "proxy"}' "$tmp_cfg" > "${tmp_cfg}.2"
-            mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            yellow "  [!] 已设置为【全局强制路由】至住宅 IP。"
-        fi
-
-        if [ -s "$tmp_cfg" ]; then
-            mv -f "$tmp_cfg" "$cfg"
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            echo ""; print_line
-            green "  🎉 代理落地节点配置完成！"
-            purple "  💡 重要提示：请务必在您的代理客户端 (v2rayN/Clash 等) 中【更新一次订阅】！"
-            sleep 4
-        else
-            red "  [错误] 配置文件最终写入失败！"
-            rm -f "$tmp_cfg"; sleep 2
-        fi
-    else
-        red "  无效的选择！操作取消。"; sleep 2; return
-    fi
-}
-
-enable_bbr() {
-    echo ""; print_line
-    if grep -q "bbr" /etc/sysctl.d/99-bbr.conf 2>/dev/null || grep -q "bbr" /etc/sysctl.conf 2>/dev/null; then
-        green "  系统已开启 BBR，无需重复配置！"; sleep 2; return
-    fi
-    mkdir -p /etc/sysctl.d
-    cat << EOF >> /etc/sysctl.d/99-bbr.conf
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+trafficStats:
+  listen: 127.0.0.1:$api_port
 EOF
-    sysctl --system >/dev/null 2>&1
-    green "  BBR 拥塞控制与 TCP 底层调优开启成功！"; sleep 2
+    
+    chmod 600 /etc/hysteria/config.yaml
+
+    local last_port=$port
+    [[ -n $firstport ]] && last_port="$port,$firstport-$endport"
+    local last_ip=$ip
+    [[ "$ip" == *":"* ]] && last_ip="[$ip]"
+
+    cat << EOF > /etc/hysteria/hy-client.yaml
+server: $last_ip:$last_port
+auth: $auth_pwd
+tls:
+  sni: $hy_domain
+  insecure: $cert_insecure_yaml
+EOF
+
+    svc_enable hysteria-server
+    svc_start hysteria-server
+    
+    generate_client_configs
+    
+    sleep 2
+    if ! ss -unl | grep -E -q ":$port( |$)"; then
+        echo ""
+        red " [致命错误] 服务端未能成功启动，端口 $port 未被监听！"
+        yellow " 请使用命令: journalctl -u hysteria-server -e 检查报错日志 (可能是证书路径错误或端口冲突)。"
+        exit 1
+    fi
+    
+    echo ""
+    print_line
+    green "  Hysteria 2 服务端及智能订阅安装部署完成！"
+    purple "  请在主菜单选择 [6] 获取节点与二维码。"
+    echo ""
+    sleep 3
 }
 
-check_keys() {
-    clear; echo ""; print_line; green "                 核心安全参数与凭证状态              "; print_line; echo ""
-    local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到凭证数据，请先安装服务！"; sleep 2; return; fi
+unsthysteria() {
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 是否彻底删除已申请的域名证书及 Acme.sh 环境？(y/n) [默认: y]: ${PLAIN}"
+    read rm_cert
+    [[ -z "$rm_cert" ]] && rm_cert="y"
+
+    yellow "  正在安全地清理系统网络、防火墙规则，并卸载相关文件..."
     
-    local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
-    yellow "  ▶ UUID 识别码 : $(jq -r '.inbounds[0].users[0].uuid' $cfg)"
-    yellow "  ▶ 目标域名(SNI): $(jq -r '.inbounds[0].tls.server_name' $cfg)"
-    
-    if [[ "$is_reality" == "true" ]]; then
-        yellow "  ▶ 节点短 ID(Sid): $(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)"
-        purple "  ▶ Reality 私钥: 已安全存储于 config.json 中"
+    if [[ "$rm_cert" == "y" || "$rm_cert" == "Y" ]]; then
+        clean_env "all"
     else
-        yellow "  ▶ 证书验证模式: 自动 ACME (Let's Encrypt)"
+        clean_env "keep"
     fi
-    echo ""; green "  状态: [✔] 核心参数读取正常。"; echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
+    
+    rm -f /usr/local/bin/hy2
+
+    echo ""
+    green "  Hysteria 2 服务及相关文件、端口规则已被彻底清理！"
+    sleep 2
+    exit 0
 }
 
 # =================================================================
-#  7. 交互主菜单 (保留原版 UI 框架，更替选项 [7])
+#  7. 二级菜单功能与辅助工具
+# =================================================================
+showconf() {
+    realip
+    
+    local sub_port=$(cat /etc/hysteria/sub_port.txt)
+    local sub_path=$(cat /etc/hysteria/sub_path.txt)
+    local sub_host=$(cat /etc/hysteria/sub_host.txt)
+    local is_insecure=$(cat /etc/hysteria/insecure_state.txt)
+    local main_port=$(grep -E "^[[:space:]]*listen:" /etc/hysteria/config.yaml | awk -F ':' '{print $NF}' | tr -d ' ' | tr -d '\r')
+    local hop_ports=$(grep '^server:' /etc/hysteria/hy-client.yaml | awk -F ',' '{print $2}')
+    
+    [[ -z "$sub_host" || "$sub_host" == "" ]] && sub_host=$ip
+    
+    local protocol="https"
+    [[ "$is_insecure" == "1" ]] && protocol="http"
+    
+    local sub_url=""
+    if [[ "$sub_host" == *":"* ]]; then
+        sub_url="${protocol}://[${sub_host}]:${sub_port}/${sub_path}"
+    else
+        sub_url="${protocol}://${sub_host}:${sub_port}/${sub_path}"
+    fi
+
+    local web_dir="/var/www/hysteria"
+    local raw_url=$(cat "$web_dir/$sub_path/url.txt")
+    
+    clear
+    echo ""
+    print_line
+    green "                 Hysteria 2 全平台智能订阅                 "
+    print_line
+    echo ""
+    yellow "  ▶ [智能订阅链接] (推荐)"
+    purple "    适用客户端: Clash Verge / v2rayN / Shadowrocket"
+    green  "    订阅地址: ${sub_url}"
+    echo ""
+    yellow "  ▶ [单节点直连链接]"
+    purple "    适用客户端: NekoBox / v2rayNG (直接导入)"
+    green  "    节点地址: ${raw_url}"
+    echo ""
+    
+    if ! command -v qrencode > /dev/null; then
+        yellow "  正在加载二维码模块..."
+        if [[ $SYSTEM == "Ubuntu" || $SYSTEM == "Debian" ]]; then
+            apt-get update -y
+            apt-get install -y qrencode
+        elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
+            yum install -y epel-release
+            yum install -y qrencode
+        elif [[ $SYSTEM == "Alpine" ]]; then
+            apk update
+            apk add libqrencode-tools
+        fi
+    fi
+
+    if command -v qrencode > /dev/null; then
+        echo ""
+        purple "  提示：若二维码断层，请将终端字体缩小，或设置行间距为1.0"
+        echo ""
+        qrencode -t ANSIUTF8 "$raw_url"
+    else
+        echo ""
+        yellow "  正通过在线 API 绘制二维码..."
+        curl -s -d "$raw_url" https://qrenco.de
+    fi
+    
+    echo ""
+    print_line
+    yellow "  ▶ 特别提醒（重要）："
+    echo -e "    ${LIGHT_GREEN}若您使用的是 阿里云/腾讯云/AWS 等自带控制台防火墙的云服务器，${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}请务必在网页控制台的【安全组】中开放以下端口：${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}主节点端口: ${main_port} (UDP)${PLAIN}"
+    if [[ -n "$hop_ports" ]]; then
+        echo -e "    ${LIGHT_RED}跳跃端口组: ${hop_ports} (UDP) - 必须放行整个范围！${PLAIN}"
+    fi
+    echo -e "    ${LIGHT_GREEN}云订阅端口: ${sub_port} (TCP)${PLAIN}"
+    echo -e "    ${LIGHT_PURPLE}若不开放上述云端防火墙，所有的订阅都将提示无效或超时！${PLAIN}"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+    read temp
+}
+
+edit_config() {
+    clear
+    if [[ ! -f /etc/hysteria/config.yaml ]]; then
+        red "  未检测到 Hysteria 2 配置文件，请先安装！"
+        sleep 2; return
+    fi
+    
+    echo ""
+    print_line
+    green "                  当前 Hysteria 2 节点配置                 "
+    print_line
+    echo ""
+    cat /etc/hysteria/config.yaml
+    echo ""
+    print_line
+    yellow "  [警告] 如果您在此处修改了 listen (主端口) 或通过系统修改了订阅端口，"
+    yellow "         脚本将无法自动更新系统的防火墙规则！修改后请务必自行放行新端口。"
+    print_line
+    echo -en " ${LIGHT_YELLOW} ▶ 是否需要修改配置文件？(y/n) [默认: n]: ${PLAIN}"
+    read edit_choice
+    if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
+        if command -v nano >/dev/null; then
+            nano /etc/hysteria/config.yaml
+        elif command -v vi >/dev/null; then
+            vi /etc/hysteria/config.yaml
+        else
+            red "  未找到 nano 或 vi 编辑器，请手动修改 /etc/hysteria/config.yaml"
+        fi
+        
+        green "  正在重启 Hysteria 2 服务验证配置..."
+        svc_stop hysteria-server
+        svc_start hysteria-server
+        sleep 1
+        
+        if [[ $SYSTEM == "Alpine" ]]; then
+            if rc-service hysteria-server status | grep -q 'started'; then
+                green "  重启成功！新配置已生效。"
+                green "  正在同步更新客户端订阅配置..."
+                generate_client_configs
+            else
+                red "  [错误] 服务重启失败！请重新检查 yaml 文件的缩进和格式是否正确。"
+            fi
+        else
+            if systemctl is-active --quiet hysteria-server; then
+                green "  重启成功！新配置已生效。"
+                green "  正在同步更新客户端订阅配置..."
+                generate_client_configs
+            else
+                red "  [错误] 服务启动失败！请重新检查 yaml 文件的缩进和格式是否正确。"
+            fi
+        fi
+    fi
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+    read temp
+}
+
+check_traffic() {
+    if [[ ! -f /etc/hysteria/config.yaml ]]; then
+        red "  未检测到 Hysteria 2 配置文件，请先安装！"
+        sleep 2; return
+    fi
+    
+    if ! grep -q -E "^[[:space:]]*trafficStats:" /etc/hysteria/config.yaml; then
+        local api_port=$(shuf -i 30000-60000 -n 1)
+        while ss -tnl | grep -E -q ":$api_port( |$)"; do api_port=$(shuf -i 30000-60000 -n 1); done
+        echo "$api_port" > /etc/hysteria/api_port.txt
+        
+        green "  正在自动开启流量统计 API..."
+        cat << EOF >> /etc/hysteria/config.yaml
+
+trafficStats:
+  listen: 127.0.0.1:$api_port
+EOF
+        svc_stop hysteria-server
+        svc_start hysteria-server
+        sleep 2
+        yellow "  流量统计功能已激活！"
+        yellow "  (注意：由于服务刚刚重启，所有历史流量已清空，请稍后重新连接并产生流量后再来查看)"
+        echo ""
+        echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+        read temp
+        return
+    else
+        local api_port=$(awk '/^[[:space:]]*trafficStats:/{flag=1} flag && /listen:/{print $NF; exit}' /etc/hysteria/config.yaml | awk -F ':' '{print $NF}' | tr -d '\r' | tr -d ' ')
+        [[ -z "$api_port" ]] && api_port=$(cat /etc/hysteria/api_port.txt | tr -d '\r')
+    fi
+
+    local traffic_data=$(curl --max-time 3 "http://127.0.0.1:$api_port/traffic" 2>/dev/null)
+    
+    clear
+    echo ""
+    print_line
+    green "                    客户端连接与流量统计                   "
+    print_line
+    echo ""
+    
+    if [[ -z "$traffic_data" || "$traffic_data" =~ "404" ]]; then
+        red "  获取数据失败，Hysteria 服务可能未正常运行，或 API 端口超时。"
+    else
+        export TRAFFIC_JSON_DATA="${traffic_data}"
+        python3 -c "
+import os, json
+try:
+    data_str = os.environ.get('TRAFFIC_JSON_DATA', '').strip()
+    if not data_str:
+        print('\033[33m  暂无任何流量消耗记录或客户端连接。\033[0m')
+    else:
+        data = json.loads(data_str)
+        if not data:
+            print('\033[33m  暂无任何流量消耗记录或客户端连接。\033[0m')
+        else:
+            print('\033[32m  当前活跃客户端总数: ' + str(len(data)) + '\033[0m\n')
+            print('\033[32m ──────────────────────────────────────────────────────────\033[0m')
+            for user, stats in data.items():
+                tx_mb = stats.get('tx', 0) / 1048576
+                rx_mb = stats.get('rx', 0) / 1048576
+                print('\033[33m  账号: {} | 发送: {:.2f} MB | 接收: {:.2f} MB\033[0m'.format(user, tx_mb, rx_mb))
+except ValueError:
+    print('\033[31m  [致命错误] API 端口返回的不是 JSON！服务可能冲突。\033[0m')
+    print('\033[33m  [调试日志] 以下是我们在端口抓取到的阻断信息：\033[0m')
+    print('  ' + data_str.replace('\n', '\n  '))
+except Exception as e:
+    print('\033[31m  获取流量数据异常: ' + str(e) + '\033[0m')
+"
+    fi
+    
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+    read temp
+}
+
+starthysteria() {
+    svc_start hysteria-server
+    svc_start hysteria-sub
+    echo ""
+    green "  Hysteria 2 及订阅服务已启动！"
+    sleep 2
+}
+
+stophysteria_only() {
+    svc_stop hysteria-server
+    svc_stop hysteria-sub
+    # 修复：准确定位，绝不误杀用户的其他 server.py 进程
+    pkill -f "/var/www/hysteria/server.py" 2>/dev/null || true
+    echo ""
+    yellow "  Hysteria 2 及订阅服务已停止！"
+}
+
+hysteriaswitch() {
+    clear
+    echo ""
+    print_line
+    green "                      服务运行状态控制                     "
+    print_line
+    echo ""
+    echo -e "    ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}启动 Hysteria 2 及订阅服务${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_RED}停止 Hysteria 2 及订阅服务${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}重启 Hysteria 2 及订阅服务${PLAIN}"
+    echo ""
+    echo -e "    ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_PURPLE}返回主菜单${PLAIN}"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [0-3]: ${PLAIN}"
+    read switchInput
+    case $switchInput in
+        1 ) starthysteria ;;
+        2 ) stophysteria_only; sleep 2 ;;
+        3 ) stophysteria_only; starthysteria ;;
+        0 ) return ;;
+        * ) red "  输入无效"; sleep 1 ;;
+    esac
+}
+
+enable_bbr() {
+    echo ""
+    print_line
+    local kernel_v=$(uname -r | cut -d. -f1)
+    if [[ "$kernel_v" -lt 4 ]]; then
+        red "  当前内核版本过低 ($(uname -r))，不支持开启 BBR！"
+        sleep 3; return
+    fi
+
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        if ! grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            red "  [错误] 当前系统/内核 (可能是 LXC 容器) 彻底不支持 BBR 模块！"
+            sleep 3; return
+        fi
+    fi
+    
+    local total_mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    
+    # 获取系统动态页面大小，规避 ARM64 的 OOM 问题
+    local page_size=$(getconf PAGESIZE 2>/dev/null)
+    [[ -z "$page_size" || ! "$page_size" =~ ^[0-9]+$ ]] && page_size=4096
+    
+    # 修复：规避 32 位系统计算整型溢出导致负数的错误
+    local mem_pages=$(( total_mem_kb / (page_size / 1024) ))
+    
+    local udp_max=$(( mem_pages / 4 ))
+    [[ $udp_max -lt 65536 ]] && udp_max=65536
+    
+    local udp_mid=$(( udp_max * 3 / 4 ))
+    local udp_min=$(( udp_max / 2 ))
+
+    mkdir -p /etc/sysctl.d
+    cat << EOF > /etc/sysctl.d/99-hysteria-bbr.conf
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=26214400
+net.core.rmem_default=26214400
+net.core.wmem_max=26214400
+net.core.wmem_default=26214400
+net.core.netdev_max_backlog=100000
+net.core.somaxconn=65535
+net.ipv4.udp_mem=$udp_min $udp_mid $udp_max
+EOF
+    
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-hysteria-bbr.conf >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1
+    
+    echo ""
+    green "  BBR 及极致的 UDP 缓冲区底层调优开启成功！"
+    yellow "  已显著拉升最大并发连接数和收发包深度，可有效抵抗大流量时的丢包状况。"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+    read temp
+}
+
+check_cert() {
+    clear
+    echo ""
+    print_line
+    green "                 证书安装诊断与健康状态检查                "
+    print_line
+    echo ""
+
+    if [[ ! -f /etc/hysteria/config.yaml ]]; then
+        red "  [✘] 未检测到 Hysteria 2 配置文件，请先安装服务！"
+        echo ""
+        echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+        read temp
+        return
+    fi
+
+    local cert_path=$(grep -w 'cert:' /etc/hysteria/config.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+    local key_path=$(grep -w 'key:' /etc/hysteria/config.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+    local has_error=0
+
+    if [[ -z "$cert_path" || -z "$key_path" ]]; then
+        red "  [✘] 配置文件中的证书路径为空！"
+        yellow "  ▶ 报错原因: config.yaml 配置被破坏，或安装时参数未能正确写入。"
+        has_error=1
+    else
+        if [[ ! -f "$cert_path" ]]; then
+            red "  [✘] 找不到证书公钥 (Cert): $cert_path"
+            yellow "  ▶ 报错原因排查:"
+            yellow "     1. [API 错误] Cloudflare Token/Key 填错，或权限不足。"
+            yellow "     2. [DNS 未生效] 刚买的域名解析还没生效，导致 Acme.sh 无法验证。"
+            yellow "     3. [频率限制] 短时间内频繁重装，触发了 Let's Encrypt 的风控机制。"
+            yellow "     4. [路径拼写] 如果您选了自定义路径，可能是手误打错了绝对路径。"
+            has_error=1
+        elif [[ ! -s "$cert_path" ]]; then
+            red "  [✘] 证书公钥 (Cert) 大小为 0 字节！"
+            yellow "  ▶ 报错原因: Acme.sh 申请过程中被强制杀掉进程，或您的 VPS 磁盘空间已爆满。"
+            has_error=1
+        elif ! grep -q "BEGIN" "$cert_path"; then
+            red "  [✘] 证书公钥 (Cert) 格式异常！"
+            yellow "  ▶ 报错原因: 文件内容损坏，不是标准的 PEM 格式。可能被其他程序覆写。"
+            has_error=1
+        else
+            green "  [✔] 公钥 (Cert) 基础状态正常: $cert_path"
+        fi
+
+        if [[ ! -f "$key_path" ]]; then
+            red "  [✘] 找不到证书私钥 (Key): $key_path"
+            yellow "  ▶ 报错原因: 私钥生成失败，同上请检查 API 和 DNS 状态。"
+            has_error=1
+        elif [[ ! -s "$key_path" ]]; then
+            red "  [✘] 证书私钥 (Key) 大小为 0 字节！"
+            yellow "  ▶ 报错原因: 系统在生成私钥时出错，可能是 VPS 熵池不足或磁盘已满。"
+            has_error=1
+        elif ! grep -q "PRIVATE KEY" "$key_path"; then
+            red "  [✘] 证书私钥 (Key) 格式异常！"
+            yellow "  ▶ 报错原因: 文件不是合法的私钥文件，请检查是否混入了其他文本。"
+            has_error=1
+        else
+            green "  [✔] 私钥 (Key) 基础状态正常: $key_path"
+        fi
+    fi
+
+    echo ""
+
+    if [[ $has_error -eq 0 ]]; then
+        if command -v openssl >/dev/null; then
+            local cert_subject=$(openssl x509 -in "$cert_path" -noout -subject | awk -F'CN = |CN=' '{print $2}' | awk -F',' '{print $1}')
+            local cert_issuer=$(openssl x509 -in "$cert_path" -noout -issuer | awk -F'CN = |CN=|O = |O=' '{print $2}' | awk -F',' '{print $1}')
+            local cert_start=$(openssl x509 -in "$cert_path" -noout -startdate | cut -d= -f2)
+            local cert_end=$(openssl x509 -in "$cert_path" -noout -enddate | cut -d= -f2)
+            local cert_algo=$(openssl x509 -in "$cert_path" -noout -text | grep "Public Key Algorithm" | awk -F':' '{print $2}' | tr -d ' ')
+
+            yellow "  ▶ 绑定的域名 (CN) : ${cert_subject:-未知}"
+            yellow "  ▶ 证书颁发机构    : ${cert_issuer:-未知}"
+            yellow "  ▶ 密钥加密算法    : ${cert_algo:-未知}"
+            yellow "  ▶ 证书生效日期    : $cert_start"
+
+            if command -v python3 >/dev/null; then
+                # 过滤单数日期双空格问题
+                local days_left=$(python3 -c "import datetime; t_str = ' '.join('$cert_end'.split()); t=datetime.datetime.strptime(t_str, '%b %d %H:%M:%S %Y %Z'); print((t - datetime.datetime.now()).days)" 2>/dev/null)
+            else
+                local end_epoch=$(date -d "$cert_end" +%s 2>/dev/null)
+                local now_epoch=$(date +%s 2>/dev/null)
+                if [[ -n "$end_epoch" && -n "$now_epoch" && "$end_epoch" =~ ^[0-9]+$ ]]; then
+                    local days_left=$(( (end_epoch - now_epoch) / 86400 ))
+                fi
+            fi
+
+            if [[ -n "$days_left" && "$days_left" =~ ^-?[0-9]+$ ]]; then
+                if [[ $days_left -lt 0 ]]; then
+                    red "  ▶ 证书过期日期    : $cert_end (⚠ 已经过期！)"
+                    yellow "  ▶ 报错原因        : 证书已过期，Acme.sh 自动续期任务可能已失效。"
+                elif [[ $days_left -lt 15 ]]; then
+                    red "  ▶ 证书过期日期    : $cert_end (⚠ 仅剩 $days_left 天，即将过期！)"
+                else
+                    green "  ▶ 证书过期日期    : $cert_end (正常，剩余 $days_left 天)"
+                fi
+            else
+                yellow "  ▶ 证书过期日期    : $cert_end"
+            fi
+
+            local is_mismatch=0
+            local cert_type="ECC"
+            
+            if openssl x509 -noout -modulus -in "$cert_path" 2>/dev/null | grep -q "Modulus"; then
+                cert_type="RSA"
+                local cert_mod=$(openssl x509 -noout -modulus -in "$cert_path" 2>/dev/null | tr -d '\r\n ')
+                local key_mod=$(openssl rsa -noout -modulus -in "$key_path" 2>/dev/null | tr -d '\r\n ')
+                if [[ "$cert_mod" == "$key_mod" && -n "$cert_mod" ]]; then
+                    green "  ▶ 证书与私钥匹配  : [✔] 完美配对 (RSA)"
+                else
+                    red "  ▶ 证书与私钥匹配  : [✘] 不匹配！"
+                    yellow "  ▶ 报错原因        : 现在的私钥解不开当前的公钥！可能是手动替换文件时只换了其中一个，或者生成时发生了错乱。"
+                    is_mismatch=1
+                fi
+            else
+                cert_type="ECC"
+                local cert_pub=$(openssl x509 -in "$cert_path" -pubkey -noout 2>/dev/null | sed '/^-----/d' | tr -d '\r\n ')
+                local key_pub=$(openssl pkey -in "$key_path" -pubout 2>/dev/null | sed '/^-----/d' | tr -d '\r\n ')
+                
+                if [[ -z "$key_pub" ]]; then
+                    key_pub=$(openssl ec -in "$key_path" -pubout 2>/dev/null | sed '/^-----/d' | tr -d '\r\n ')
+                fi
+
+                if [[ "$cert_pub" == "$key_pub" && -n "$cert_pub" ]]; then
+                    green "  ▶ 证书与私钥匹配  : [✔] 完美配对 (ECC)"
+                else
+                    red "  ▶ 证书与私钥匹配  : [✘] 不匹配！"
+                    yellow "  ▶ 报错原因        : ECC 公钥指纹与私钥不对应。必须保证 crt 和 key 是同一批次生成的。"
+                    is_mismatch=1
+                fi
+            fi
+
+            if [[ $is_mismatch -eq 1 && -f "/root/.acme.sh/acme.sh" ]]; then
+                echo ""
+                print_line
+                yellow "  检测到证书不匹配！是否尝试使用 Acme.sh 本地缓存自动修复？"
+                echo -en " ${LIGHT_YELLOW} ▶ 请输入 (y/n) [默认: y]: ${PLAIN}"
+                read try_repair
+                [[ -z "$try_repair" ]] && try_repair="y"
+                
+                if [[ "$try_repair" == "y" || "$try_repair" == "Y" ]]; then
+                    echo ""
+                    green "  正在执行自动修复并重新提取证书..."
+                    local acme_ecc_param=""
+                    [[ "$cert_type" == "ECC" ]] && acme_ecc_param="--ecc"
+                    
+                    bash /root/.acme.sh/acme.sh --install-cert -d "$cert_subject" $acme_ecc_param \
+                        --key-file /root/private.key \
+                        --fullchain-file /root/cert.crt
+                    
+                    if [[ $? -eq 0 ]]; then
+                        chmod 644 /root/cert.crt
+                        chmod 600 /root/private.key
+                        mkdir -p /var/www/hysteria/certs
+                        cp -f /root/cert.crt /var/www/hysteria/certs/cert.crt
+                        cp -f /root/private.key /var/www/hysteria/certs/private.key
+                        chown -R nobody /var/www/hysteria/certs
+                        
+                        if [[ $SYSTEM == "Alpine" ]]; then
+                            rc-service hysteria-server restart 2>/dev/null
+                            rc-service hysteria-sub restart 2>/dev/null
+                        else
+                            systemctl restart hysteria-server 2>/dev/null
+                            systemctl restart hysteria-sub 2>/dev/null
+                        fi
+                        echo ""
+                        green "  [✔] 修复完成！核心服务与订阅服务已自动同步并重启。"
+                    else
+                        echo ""
+                        red "  [✘] 修复失败！Acme.sh 目录中可能没有该域名 ($cert_subject) 的有效缓存。"
+                    fi
+                fi
+            fi
+
+            if [[ "$cert_subject" == "www.bing.com" || "$cert_issuer" =~ "bing.com" ]]; then
+                echo ""
+                yellow "  ℹ 提示: 当前使用的是系统自动生成的【必应自签伪装证书】。"
+            elif [[ "$cert_issuer" =~ "Let's Encrypt" || "$cert_issuer" =~ "ZeroSSL" || "$cert_issuer" =~ "Google" || "$cert_issuer" =~ "Cloudflare" ]]; then
+                echo ""
+                green "  ℹ 提示: 当前使用的是受信任的【真实 CA 域名证书】。"
+                
+                if [[ -f "/root/.acme.sh/acme.sh" || -f "/root/ca.log" ]]; then
+                    echo ""
+                    purple "  [Acme.sh 守护进程自检]"
+                    if crontab -l 2>/dev/null | grep -q "acme.sh"; then
+                        green "  ▶ Cron 定时任务   : [✔] 正常运行中"
+                    else
+                        red "  ▶ Cron 定时任务   : [✘] 缺失！"
+                        yellow "  ▶ 报错原因        : 系统的 crontab 被清空或卸载了 cronie 组件，证书到期后将无法自动续期。"
+                    fi
+                fi
+            fi
+        else
+            red "  [警告] 系统未安装 openssl 组件，跳过了深度密码学检测。"
+        fi
+    fi
+    
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"
+    read temp
+}
+
+config_outbound() {
+    clear
+    echo ""
+    print_line
+    green "                 Hysteria 2 落地代理 (静态住宅 IP 中转) 设置               "
+    print_line
+    echo ""
+
+    if [[ ! -f /etc/hysteria/config.yaml ]]; then
+        red "  未检测到 Hysteria 2 配置文件，请先安装！"
+        sleep 2; return
+    fi
+
+    # 检查当前是否开启了 outbound
+    if grep -q "^outbound:" /etc/hysteria/config.yaml; then
+        local current_type=$(awk '/^outbound:/{getline; print $2}' /etc/hysteria/config.yaml | tr -d '\r')
+        yellow "  当前状态: [已开启] 落地代理模式 (类型: $current_type)"
+        
+        # 提取当前代理地址用于展示
+        local current_addr=""
+        if [[ "$current_type" == "socks5" ]]; then
+            current_addr=$(awk '/socks5:/{getline; print $2}' /etc/hysteria/config.yaml | awk '/addr:/{print $2}' | tr -d '\r')
+        elif [[ "$current_type" == "http" ]]; then
+            current_addr=$(awk '/http:/{getline; print $2}' /etc/hysteria/config.yaml | awk '/url:/{print $2}' | tr -d '\r')
+        fi
+        [[ -n "$current_addr" ]] && green "  当前代理地址: $current_addr"
+    else
+        green "  当前状态: [未开启] 本机 IP 直连输出"
+    fi
+    echo ""
+    
+    echo -e "    ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}配置 / 修改 落地代理 (支持一键粘贴完整 URI 格式)${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_RED}退回 服务器直连 (关闭当前落地代理)${PLAIN}"
+    echo -e "    ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}检查 落地状态 (验证静态住宅 IP 与核心状态)${PLAIN}"
+    echo ""
+    echo -e "    ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_PURPLE}返回主菜单${PLAIN}"
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [0-3]: ${PLAIN}"
+    read out_choice
+
+    case $out_choice in
+        1)
+            echo ""
+            yellow "  ▶ 请输入完整的代理 URI"
+            yellow "  (支持格式: socks5://user:pass@ip:port 或 http://user:pass@ip:port)"
+            echo -en " ${LIGHT_YELLOW} ▶ 代理 URI: ${PLAIN}"
+            read proxy_uri
+            [[ -z "$proxy_uri" ]] && { red " 地址不能为空！"; sleep 2; return; }
+
+            proxy_uri=$(echo "$proxy_uri" | tr -d '\r' | tr -d ' ')
+
+            # 正则解析 URI 字符串
+            local out_type=""
+            local out_user=""
+            local out_pass=""
+            local out_addr=""
+
+            if [[ "$proxy_uri" =~ ^(socks5|http):// ]]; then
+                out_type="${BASH_REMATCH[1]}"
+                local remain="${proxy_uri#*://}"
+                if [[ "$remain" == *"@"* ]]; then
+                    local userpass="${remain%@*}"
+                    out_addr="${remain#*@}"
+                    out_user="${userpass%:*}"
+                    out_pass="${userpass#*:}"
+                else
+                    out_addr="$remain"
+                fi
+            else
+                red "  [错误] 格式不正确！必须以 socks5:// 或 http:// 开头。"
+                sleep 2; return
+            fi
+
+            echo ""
+            yellow "  正在测试静态住宅 IP 代理的连通性..."
+            
+            # 兼容 curl 的原生代理测试格式
+            local curl_proxy="$proxy_uri"
+            local test_res=$(curl -x "$curl_proxy" -s -m 7 https://api.ipify.org)
+            
+            if [[ -n "$test_res" && ("$test_res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$test_res" =~ :) ]]; then
+                green "  [✔] 代理连通测试成功！获取到静态住宅出口 IP: ${test_res}"
+            else
+                red "  [✘] 代理测试失败！无法通过该代理连接外网 (请求超时或验证被拒绝)。"
+                echo -en " ${LIGHT_YELLOW} ▶ 代理可能无效，是否强制保存并继续？(y/n) [默认: n]: ${PLAIN}"
+                read force_save
+                [[ "$force_save" != "y" && "$force_save" != "Y" ]] && { yellow "  已取消中转配置。"; sleep 2; return; }
+            fi
+
+            cp -f /etc/hysteria/config.yaml /etc/hysteria/config.yaml.bak
+
+            # 精准删除旧的 outbound 块
+            awk '
+            /^outbound:/ { in_outbound=1; next }
+            /^[^[:space:]#]/ && !/^outbound:/ { if(in_outbound) in_outbound=0 }
+            { if(!in_outbound) print $0 }
+            ' /etc/hysteria/config.yaml > /tmp/hy2_config_tmp.yaml
+            
+            # 构建新的 outbound 块
+            local out_block="outbound:\n"
+            if [[ "$out_type" == "socks5" ]]; then
+                out_block+="  type: socks5\n  socks5:\n    addr: $out_addr\n"
+                [[ -n "$out_user" ]] && out_block+="    username: $out_user\n    password: $out_pass\n"
+            else
+                out_block+="  type: http\n  http:\n    url: $proxy_uri\n"
+            fi
+
+            # 安全插入配置末尾
+            if grep -q "^trafficStats:" /tmp/hy2_config_tmp.yaml; then
+                awk -v block="$(echo -e "$out_block")" '/^trafficStats:/ {print block} {print}' /tmp/hy2_config_tmp.yaml > /tmp/hy2_config_tmp2.yaml
+                mv -f /tmp/hy2_config_tmp2.yaml /tmp/hy2_config_tmp.yaml
+            else
+                echo -e "$out_block" >> /tmp/hy2_config_tmp.yaml
+            fi
+
+            mv -f /tmp/hy2_config_tmp.yaml /etc/hysteria/config.yaml
+            green "  新落地代理配置写入完毕！"
+            
+            # 强制重启核心使其生效
+            echo ""
+            yellow "  正在重启 Hysteria 2 核心应用配置..."
+            svc_stop hysteria-server 2>/dev/null
+            svc_start hysteria-server
+
+            sleep 2
+
+            local is_active=0
+            if [[ $SYSTEM == "Alpine" ]]; then
+                rc-service hysteria-server status 2>/dev/null | grep -q 'started' && is_active=1
+            else
+                systemctl is-active --quiet hysteria-server 2>/dev/null && is_active=1
+            fi
+
+            if [[ $is_active -eq 1 ]]; then
+                green "  [✔] 重启成功！静态住宅 IP 落地规则已全面生效。"
+            else
+                red "  [✘] 致命错误：核心服务启动失败！可能配置文件语法存在冲突。"
+                purple "  正在为您自动回滚到修改前的稳定配置..."
+                mv -f /etc/hysteria/config.yaml.bak /etc/hysteria/config.yaml
+                svc_start hysteria-server
+                green "  [✔] 回滚完成，已恢复原状。"
+            fi
+            ;;
+        2)
+            cp -f /etc/hysteria/config.yaml /etc/hysteria/config.yaml.bak
+            
+            awk '
+            /^outbound:/ { in_outbound=1; next }
+            /^[^[:space:]#]/ && !/^outbound:/ { if(in_outbound) in_outbound=0 }
+            { if(!in_outbound) print $0 }
+            ' /etc/hysteria/config.yaml > /tmp/hy2_config_tmp.yaml
+            
+            mv -f /tmp/hy2_config_tmp.yaml /etc/hysteria/config.yaml
+            green "  已清除落地代理配置参数。"
+            
+            yellow "  正在重启 Hysteria 2 核心..."
+            svc_stop hysteria-server 2>/dev/null
+            svc_start hysteria-server
+            sleep 2
+            green "  [✔] 重启成功！已安全退回服务器本机 IP 直连输出模式。"
+            ;;
+        3)
+            echo ""
+            print_line
+            yellow "  ▶ 正在检查落地代理运行与健康状态..."
+            if ! grep -q "^outbound:" /etc/hysteria/config.yaml; then
+                red "  当前未开启落地代理，正在使用本机原生直连。"
+            else
+                local current_type=$(awk '/^outbound:/{getline; print $2}' /etc/hysteria/config.yaml | tr -d '\r')
+                local curl_proxy=""
+                
+                # 提取供 curl 测试使用的格式
+                if [[ "$current_type" == "socks5" ]]; then
+                    local s_addr=$(awk '/socks5:/{getline; print $2}' /etc/hysteria/config.yaml | awk '/addr:/{print $2}' | tr -d '\r')
+                    local s_user=$(awk '/socks5:/{getline; getline; print $0}' /etc/hysteria/config.yaml | awk '/username:/{print $2}' | tr -d '\r')
+                    local s_pass=$(awk '/socks5:/{getline; getline; getline; print $0}' /etc/hysteria/config.yaml | awk '/password:/{print $2}' | tr -d '\r')
+                    if [[ -n "$s_user" ]]; then
+                        curl_proxy="socks5h://${s_user}:${s_pass}@${s_addr}"
+                    else
+                        curl_proxy="socks5h://${s_addr}"
+                    fi
+                elif [[ "$current_type" == "http" ]]; then
+                    curl_proxy=$(awk '/http:/{getline; print $2}' /etc/hysteria/config.yaml | awk '/url:/{print $2}' | tr -d '\r')
+                fi
+
+                echo ""
+                yellow "  [1/2] 测试外网 TCP 连通性与真实出口 IP 伪装度..."
+                local test_ip=$(curl -x "$curl_proxy" -s -m 5 https://api.ipify.org)
+                if [[ -n "$test_ip" && ("$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$test_ip" =~ :) ]]; then
+                    green "  [✔] 落地状态正常！您的最终出口 IP 现为: $test_ip"
+                else
+                    red "  [✘] 测试失败！您的静态住宅代理可能已过期、被封禁或格式错误导致无法连通网络。"
+                fi
+
+                echo ""
+                yellow "  [2/2] 检查 Hysteria 2 守护进程运转情况..."
+                local is_active=0
+                if [[ $SYSTEM == "Alpine" ]]; then
+                    rc-service hysteria-server status 2>/dev/null | grep -q 'started' && is_active=1
+                else
+                    systemctl is-active --quiet hysteria-server 2>/dev/null && is_active=1
+                fi
+                
+                if [[ $is_active -eq 1 ]]; then
+                    green "  [✔] 核心进程状态: 活跃 (Active & Running)"
+                else
+                    red "  [✘] 核心进程状态: 停止/崩溃 (Inactive)"
+                fi
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            red "  输入无效"; sleep 1; return
+            ;;
+    esac
+
+    echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回... ${PLAIN}"
+    read temp
+}
+
+# =================================================================
+#  8. 主菜单控制
 # =================================================================
 menu() {
     clear
@@ -924,22 +1826,22 @@ menu() {
     echo -e "${LIGHT_GREEN}  ██████╔╝ ╚██████╔╝ ╚██████╔╝███████╗ ██║  ██║${PLAIN}"
     echo -e "${LIGHT_GREEN}  ╚═════╝   ╚══════╝  ╚═════╝ ╚══════╝ ╚═╝  ╚═╝${PLAIN}"
     green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green " 项目名称 ：VLESS 多模式全能部署与管理脚本 (修复升级版)"
+    green " 项目名称 ：Hysteria 2 一键部署与管理脚本 (单人旗舰加固版)"
     purple " 项目地址 ：哆啦的Github库 https://github.com/yanbinlti-glitch"
     green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    yellow " 脚本快捷方式：vvv (已自动配置，下次可在终端直接输入 vvv 启动)"
+    yellow " 脚本快捷方式：hy2 (已自动配置，下次可在终端直接输入 hy2 启动)"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}安装部署 VLESS 多模式核心 (Reality / TLS / WS)${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_RED}彻底卸载 VLESS 及清理环境${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}安装部署 Hysteria 2${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_RED}彻底卸载 Hysteria 2${PLAIN}"
     echo "----------------------------------------------------------------------------------"
     echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_YELLOW}启动 / 停止 / 重启服务${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[4]${PLAIN} ${LIGHT_PURPLE}查看 / 修改 核心配置文件${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[5]${PLAIN} ${LIGHT_GREEN}修改 伪装域名 (SNI / 真实域名)${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[4]${PLAIN} ${LIGHT_PURPLE}查看 / 修改 配置文件${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[5]${PLAIN} ${LIGHT_GREEN}配置 出口落地代理 (中转模式 & 深度诊断)${PLAIN}"
     echo "----------------------------------------------------------------------------------"
     echo -e "  ${LIGHT_GREEN}[6]${PLAIN} ${LIGHT_GREEN}获取 节点配置 与 订阅链接${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[7]${PLAIN} ${LIGHT_YELLOW}配置 静态住宅 IP 落地 (防封锁/原生解锁)${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[8]${PLAIN} ${LIGHT_PURPLE}开启 BBR 拥塞控制调优 (强烈推荐)${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[9]${PLAIN} ${LIGHT_GREEN}检查 核心安全密钥与参数状态${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[7]${PLAIN} ${LIGHT_YELLOW}查看 客户端连接 与 流量统计${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[8]${PLAIN} ${LIGHT_PURPLE}开启 BBR 及 UDP 极限并发加速 (强烈推荐)${PLAIN}"
+    echo -e "  ${LIGHT_GREEN}[9]${PLAIN} ${LIGHT_GREEN}检查 证书安装状态与详细信息${PLAIN}"
     echo "----------------------------------------------------------------------------------"
     echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}退出脚本${PLAIN}"
     red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -947,15 +1849,15 @@ menu() {
     echo -en " ${LIGHT_YELLOW} ▶ 请输入选项 [0-9]: ${PLAIN}"
     read menuInput
     case $menuInput in
-        1 ) inst_mode_menu ;;
-        2 ) clean_env; red "  已彻底安全卸载并清理环境！"; sleep 1; exit 0 ;;
-        3 ) proxy_switch ;;
+        1 ) insthysteria ;;
+        2 ) unsthysteria ;;
+        3 ) hysteriaswitch ;;
         4 ) edit_config ;;
-        5 ) modify_sni ;;
+        5 ) config_outbound ;;
         6 ) showconf ;;
-        7 ) setup_chain_outbound ;;
+        7 ) check_traffic ;;
         8 ) enable_bbr ;;
-        9 ) check_keys ;;
+        9 ) check_cert ;;
         0 ) exit 0 ;;
         * ) red "  输入无效"; sleep 1 ;;
     esac
