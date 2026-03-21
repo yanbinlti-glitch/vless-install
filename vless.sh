@@ -81,7 +81,6 @@ gen_random_str() {
     echo "${str:0:$len}"
 }
 
-# 【优化 1】修复防火墙规则冗余 (先删后加)
 open_port() {
     local port=$1
     if command -v ufw >/dev/null && ufw status | grep -qw active; then
@@ -98,7 +97,6 @@ open_port() {
     fi
 }
 
-# 【优化 1】修复防火墙规则冗余 (循环彻底清除)
 close_port() {
     local port=$1
     if command -v ufw >/dev/null && ufw status | grep -qw active; then
@@ -123,7 +121,9 @@ check_domain_dns() {
     yellow "  正在验证 [$domain] 的解析记录..."
     realip
     local local_ip=$ip
-    local domain_ip=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" | grep -oP '"data":"\K[^"]+' | head -1 2>/dev/null)
+    
+    # 【修复 1】: 抛弃 grep -oP，改用全平台兼容的 sed 进行 JSON 字段提取
+    local domain_ip=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" | sed -n 's/.*"data":"\([^"]*\)".*/\1/p' | head -1 2>/dev/null)
     [[ -z "$domain_ip" ]] && domain_ip=$(ping -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
 
     if [[ "$domain_ip" == "$local_ip" ]]; then
@@ -157,7 +157,6 @@ check_env() {
     green "  [✔] 所有前置依赖补全完成！"; sleep 1
 }
 
-# 【优化 4】优化 GitHub API 速率限制问题
 inst_singbox_core() {
     echo ""; print_line; yellow "  正在下载 sing-box 二进制核心..."; 
     local arch=$(uname -m); local sb_arch=""
@@ -243,7 +242,6 @@ collect_tls_info() {
     collect_base_info
 }
 
-# 【优化 2】增加 Cloudflare ALPN 警告
 collect_ws_info() {
     echo ""; print_line; green "            配置 VLESS + WS + TLS (CDN 救星)            "; print_line; echo ""
     red "  ⚠️ [重要警告] 如果您使用 Cloudflare 等 CDN 服务，请务必先将域名解析设置为"
@@ -358,7 +356,6 @@ EOF
     open_port $NODE_PORT; open_port $SUB_PORT
 }
 
-# 【优化 3】优化 Python 服务端：取消内存死缓存，动态读取订阅内容
 generate_client_configs() {
     realip
     local cfg="/usr/local/etc/sing-box/config.json"
@@ -384,20 +381,67 @@ generate_client_configs() {
     local clash_proxy_yaml=""
     local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
 
+    # 【修复 2】: 抛弃隐式 `echo -e` 拼接，直接在结构内格式化保证 YAML 的绝对安全缩进
     if [[ "$is_reality" == "true" ]]; then
         local pbk=$(cat /usr/local/etc/sing-box/public_key.meta 2>/dev/null)
         local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)
         url="vless://${uuid}@${uri_ip}:${port}?encryption=none${flow_url}&security=reality&sni=${domain}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${uri_ip}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true${clash_flow}\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: \"${pbk}\"\n      short-id: \"${sid}\""
+        
+        clash_proxy_yaml=$(cat <<EOF
+  - name: '${node_name}'
+    type: vless
+    server: "${uri_ip}"
+    port: ${port}
+    uuid: "${uuid}"
+    network: tcp
+    tls: true
+    udp: true${clash_flow}
+    servername: "${domain}"
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: "${pbk}"
+      short-id: "${sid}"
+EOF
+)
 
     elif [[ "$is_ws" == "ws" ]]; then
         local ws_path=$(jq -r '.inbounds[0].transport.path' $cfg)
         url="vless://${uuid}@${domain}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&path=${ws_path}&host=${domain}#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: ws\n    tls: true\n    udp: true\n    servername: \"${domain}\"\n    client-fingerprint: chrome\n    ws-opts:\n      path: \"${ws_path}\"\n      headers:\n        Host: \"${domain}\""
+        
+        clash_proxy_yaml=$(cat <<EOF
+  - name: '${node_name}'
+    type: vless
+    server: "${domain}"
+    port: ${port}
+    uuid: "${uuid}"
+    network: ws
+    tls: true
+    udp: true
+    servername: "${domain}"
+    client-fingerprint: chrome
+    ws-opts:
+      path: "${ws_path}"
+      headers:
+        Host: "${domain}"
+EOF
+)
         
     else
         url="vless://${uuid}@${domain}:${port}?encryption=none${flow_url}&security=tls&sni=${domain}&fp=chrome&type=tcp&headerType=none#${safe_node_name}"
-        clash_proxy_yaml="  - name: '${node_name}'\n    type: vless\n    server: \"${domain}\"\n    port: ${port}\n    uuid: \"${uuid}\"\n    network: tcp\n    tls: true\n    udp: true${clash_flow}\n    servername: \"${domain}\"\n    client-fingerprint: chrome"
+        
+        clash_proxy_yaml=$(cat <<EOF
+  - name: '${node_name}'
+    type: vless
+    server: "${domain}"
+    port: ${port}
+    uuid: "${uuid}"
+    network: tcp
+    tls: true
+    udp: true${clash_flow}
+    servername: "${domain}"
+    client-fingerprint: chrome
+EOF
+)
     fi
 
     local web_dir="/var/www/vless"
@@ -416,7 +460,7 @@ mode: rule
 log-level: info
 ipv6: true
 proxies:
-$(echo -e "$clash_proxy_yaml")
+${clash_proxy_yaml}
 proxy-groups:
   - name: "节点选择"
     type: select
@@ -614,29 +658,9 @@ proxy_switch() {
     esac
 }
 
-edit_config() {
-    clear; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
-    echo ""; print_line; green "                  当前核心 JSON 配置                   "; print_line; echo ""
-    cat $cfg; echo ""; print_line
-    echo -en " ${LIGHT_YELLOW} ▶ 是否手动修改配置文件？(y/n) [默认: n]: ${PLAIN}"; read edit_choice
-    if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
-        cp $cfg /tmp/config_backup.json
-        if command -v nano >/dev/null; then nano $cfg; else vi $cfg; fi
-        yellow "  正在校验语法..."
-        if ! /usr/local/bin/sing-box check -c $cfg >/dev/null 2>&1; then
-            red "  [错误] 语法错误！已回滚配置。"; mv /tmp/config_backup.json $cfg
-        else
-            green "  语法通过，正在重启同步..."; rm -f /tmp/config_backup.json
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  重启同步完成！"
-        fi
-    fi
-    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
-}
-
 modify_sni() {
+    # 【修复 3】: 阻止依赖不全导致的文件被异常置空
+    if ! command -v jq >/dev/null; then red "  [错误] 缺失核心组件(jq)，请先执行安装部署 (选项 1)！"; sleep 2; return; fi
     clear; local cfg="/usr/local/etc/sing-box/config.json"
     if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
     local old_sni=$(jq -r '.inbounds[0].tls.server_name' $cfg)
@@ -665,6 +689,28 @@ modify_sni() {
     echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
+edit_config() {
+    clear; local cfg="/usr/local/etc/sing-box/config.json"
+    if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
+    echo ""; print_line; green "                  当前核心 JSON 配置                   "; print_line; echo ""
+    cat $cfg; echo ""; print_line
+    echo -en " ${LIGHT_YELLOW} ▶ 是否手动修改配置文件？(y/n) [默认: n]: ${PLAIN}"; read edit_choice
+    if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
+        cp $cfg /tmp/config_backup.json
+        if command -v nano >/dev/null; then nano $cfg; else vi $cfg; fi
+        yellow "  正在校验语法..."
+        if ! /usr/local/bin/sing-box check -c $cfg >/dev/null 2>&1; then
+            red "  [错误] 语法错误！已回滚配置。"; mv /tmp/config_backup.json $cfg
+        else
+            green "  语法通过，正在重启同步..."; rm -f /tmp/config_backup.json
+            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
+            generate_client_configs
+            green "  重启同步完成！"
+        fi
+    fi
+    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
+}
+
 showconf() {
     realip; local cfg="/usr/local/etc/sing-box/config.json"
     if [[ ! -f $cfg ]]; then red "  未检测到配置，请先安装！"; sleep 2; return; fi
@@ -681,8 +727,9 @@ showconf() {
     echo ""; print_line; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
-# 【优化 5 & 6】住宅 IP 一键 URI 导入，修复 curl HTTPS 代理测试误报
 setup_chain_outbound() {
+    # 【修复 3】: 阻止依赖不全导致的文件被异常置空
+    if ! command -v jq >/dev/null; then red "  [错误] 缺失核心组件(jq)，请先执行安装部署 (选项 1)！"; sleep 2; return; fi
     clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
     local cfg="/usr/local/etc/sing-box/config.json"
     local tmp_cfg="/tmp/sb_tmp.json"
@@ -699,7 +746,6 @@ setup_chain_outbound() {
     echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 请选择操作 [0-2]: ${PLAIN}"; read out_type
 
-    # 0. 恢复直连
     if [[ "$out_type" == "0" ]]; then
         jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
         if [ -s "$tmp_cfg" ]; then
@@ -714,7 +760,6 @@ setup_chain_outbound() {
         fi
     fi
 
-    # 2. 测试连通性
     if [[ "$out_type" == "2" ]]; then
         echo ""; print_line
         local cur_type=$(jq -r '.outbounds[] | select(.tag == "proxy") | .type' "$cfg" 2>/dev/null)
@@ -768,7 +813,6 @@ setup_chain_outbound() {
         return
     fi
 
-    # 1. 解析 URI 并配置节点
     if [[ "$out_type" == "1" ]]; then
         echo -en " ${LIGHT_YELLOW} ▶ 请粘贴代理 URI: ${PLAIN}"; read proxy_uri
         
