@@ -39,18 +39,9 @@
 
 ---
 
-## 🚀 安装与使用
+## 🚀 一键部署启动
 
-### 1. 下载并运行脚本
-
-请在 `root` 用户下执行以下命令：
+请在登录 VPS 后（确保具有 `root` 权限），直接复制并运行以下**一键安装命令**：
 
 ```bash
-# 1. 下载脚本 (假设您的脚本命名为 vless.sh)
-# wget -O vless.sh [https://raw.githubusercontent.com/yanbinlti-glitch/.../vless.sh](https://raw.githubusercontent.com/yanbinlti-glitch/.../vless.sh)
-
-# 2. 赋予执行权限
-chmod +x vless.sh
-
-# 3. 运行脚本
-sudo ./vless.sh
+wget -O vless.sh [https://raw.githubusercontent.com/yanbinlti-glitch/YOUR_REPO_NAME/main/vless.sh](https://raw.githubusercontent.com/yanbinlti-glitch/YOUR_REPO_NAME/main/vless.sh) && chmod +x vless.sh && sudo ./vless.sh
