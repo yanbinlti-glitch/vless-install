@@ -122,8 +122,8 @@ check_domain_dns() {
     realip
     local local_ip=$ip
     
-    # 【修复 1】: 抛弃 grep -oP，改用全平台兼容的 sed 进行 JSON 字段提取
-    local domain_ip=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" | sed -n 's/.*"data":"\([^"]*\)".*/\1/p' | head -1 2>/dev/null)
+    # 【修复】使用非贪婪正则配合 awk 提取精确 IPv4，避免多条目解析导致漏判
+    local domain_ip=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" 2>/dev/null | grep -o '"data":"[^"]*"' | head -1 | awk -F'"' '{print $4}')
     [[ -z "$domain_ip" ]] && domain_ip=$(ping -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
 
     if [[ "$domain_ip" == "$local_ip" ]]; then
@@ -143,18 +143,46 @@ check_domain_dns() {
 # =================================================================
 check_env() {
     clear; echo ""; print_line; green "                   系统依赖与环境检查                      "; print_line; echo ""
-    yellow "  正在检查并补全前置依赖 (含 jq, curl, openssl)..."
+    yellow "  正在检查并补全前置依赖 (含 jq, curl, openssl, socat)..."
     [[ ! $SYSTEM == "CentOS" ]] && $PKG_UPDATE >/dev/null 2>&1
     if [[ $SYSTEM == "Alpine" ]]; then
-        $PKG_INSTALL curl wget sudo procps iptables iproute2 python3 openssl tar gzip jq gcompat libc6-compat >/dev/null 2>&1
+        $PKG_INSTALL curl wget sudo procps iptables iproute2 python3 openssl tar gzip jq gcompat libc6-compat socat >/dev/null 2>&1
         mkdir -p /lib64 && [[ ! -f /lib64/ld-linux-x86-64.so.2 ]] && ln -s /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2 2>/dev/null
     elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" || $SYSTEM == "Alma" || $SYSTEM == "Rocky" ]]; then
         $PKG_INSTALL epel-release >/dev/null 2>&1 || true
-        $PKG_INSTALL curl wget sudo procps iptables iproute python3 openssl tar gzip jq >/dev/null 2>&1
+        $PKG_INSTALL curl wget sudo procps iptables iproute python3 openssl tar gzip jq socat >/dev/null 2>&1
     else
-        $PKG_INSTALL curl wget sudo procps iptables-persistent netfilter-persistent iproute2 python3 openssl tar gzip jq >/dev/null 2>&1
+        $PKG_INSTALL curl wget sudo procps iptables-persistent netfilter-persistent iproute2 python3 openssl tar gzip jq socat >/dev/null 2>&1
     fi
     green "  [✔] 所有前置依赖补全完成！"; sleep 1
+}
+
+# 【新增】独立 acme.sh 证书申请与管理
+issue_cert() {
+    local domain=$1
+    echo ""; print_line; yellow "  正在安装 acme.sh 并申请 TLS 证书 (Standalone 模式)..."; echo ""
+    curl -sL https://get.acme.sh | sh -s email=admin@${domain} >/dev/null 2>&1
+    source ~/.bashrc 2>/dev/null || true
+    /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
+    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    
+    mkdir -p /usr/local/etc/sing-box/cert
+    
+    # 申请前临时放行 80 端口
+    open_port 80
+    if ! /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --force; then
+        close_port 80
+        red "  [致命错误] 证书申请失败！"
+        red "  请检查: 1. 域名是否准确解析到本机 IP"
+        red "          2. 防火墙是否放行了 80 端口"
+        red "          3. 若使用了 CDN，请确保证书申请期间已设为【仅 DNS (灰云)】"
+        exit 1
+    fi
+    close_port 80
+    
+    /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath /usr/local/etc/sing-box/cert/fullchain.cer --keypath /usr/local/etc/sing-box/cert/private.key --ecc --force >/dev/null 2>&1
+    chmod 644 /usr/local/etc/sing-box/cert/*
+    green "  [✔] 证书申请并部署成功！"
 }
 
 inst_singbox_core() {
@@ -302,6 +330,7 @@ generate_singbox_config() {
 }
 EOF
 )
+    # 【修复】剥离 1.8.0 废弃的 acme 字段，改为加载本地证书路径
     elif [[ $INSTALL_MODE -eq 2 ]]; then
         json_content=$(cat <<EOF
 {
@@ -312,16 +341,15 @@ EOF
     "users": [{ "uuid": "$vless_uuid", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true, "server_name": "$NODE_DOMAIN",
-      "acme": {
-        "domain": ["$NODE_DOMAIN"], "data_directory": "/usr/local/etc/sing-box",
-        "default_server_name": "$NODE_DOMAIN", "email": "admin@$NODE_DOMAIN"
-      }
+      "certificate_path": "/usr/local/etc/sing-box/cert/fullchain.cer",
+      "key_path": "/usr/local/etc/sing-box/cert/private.key"
     }
   }],
   "outbounds": [{ "type": "direct", "tag": "direct" }]
 }
 EOF
 )
+    # 【修复】剥离 1.8.0 废弃的 acme 字段，改为加载本地证书路径
     elif [[ $INSTALL_MODE -eq 3 ]]; then
         json_content=$(cat <<EOF
 {
@@ -332,10 +360,8 @@ EOF
     "users": [{ "uuid": "$vless_uuid" }],
     "tls": {
       "enabled": true, "server_name": "$NODE_DOMAIN",
-      "acme": {
-        "domain": ["$NODE_DOMAIN"], "data_directory": "/usr/local/etc/sing-box",
-        "default_server_name": "$NODE_DOMAIN", "email": "admin@$NODE_DOMAIN"
-      }
+      "certificate_path": "/usr/local/etc/sing-box/cert/fullchain.cer",
+      "key_path": "/usr/local/etc/sing-box/cert/private.key"
     },
     "transport": {
       "type": "ws", "path": "$WS_PATH",
@@ -381,7 +407,6 @@ generate_client_configs() {
     local clash_proxy_yaml=""
     local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
 
-    # 【修复 2】: 抛弃隐式 `echo -e` 拼接，直接在结构内格式化保证 YAML 的绝对安全缩进
     if [[ "$is_reality" == "true" ]]; then
         local pbk=$(cat /usr/local/etc/sing-box/public_key.meta 2>/dev/null)
         local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)
@@ -479,6 +504,7 @@ EOF
 
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     
+    # 【修复】增加 log_message: pass 屏蔽冗余扫描日志
     cat << EOF > "$web_dir/vless_server.py"
 import http.server, socketserver, urllib.parse, socket, os
 PORT = $sub_port
@@ -486,6 +512,7 @@ SUB_UUID = "$sub_uuid"
 
 class SecureSubHandler(http.server.BaseHTTPRequestHandler):
     server_version = "nginx/1.24.0"; sys_version = ""
+    def log_message(self, format, *args): pass
     def do_GET(self):
         req_path = urllib.parse.urlparse(self.path).path.strip('/')
         if req_path == SUB_UUID:
@@ -559,7 +586,13 @@ EOF
 }
 
 inst_proxy_core() {
-    check_env; inst_singbox_core; generate_singbox_config
+    check_env
+    # 【修复】自动接管 TLS 证书申请
+    if [[ $INSTALL_MODE -eq 2 || $INSTALL_MODE -eq 3 ]]; then
+        issue_cert "$NODE_DOMAIN"
+    fi
+    
+    inst_singbox_core; generate_singbox_config
 
     if [[ $SYSTEM == "Alpine" ]]; then
         cat << 'EOF' > /etc/init.d/sing-box
@@ -640,6 +673,8 @@ clean_env() {
     fi
     pkill -f "vless_server.py" 2>/dev/null || true
     rm -rf /usr/local/bin/sing-box /usr/local/etc/sing-box /var/www/vless
+    /root/.acme.sh/acme.sh --uninstall >/dev/null 2>&1 || true
+    rm -rf /root/.acme.sh
 }
 
 proxy_switch() {
@@ -659,7 +694,6 @@ proxy_switch() {
 }
 
 modify_sni() {
-    # 【修复 3】: 阻止依赖不全导致的文件被异常置空
     if ! command -v jq >/dev/null; then red "  [错误] 缺失核心组件(jq)，请先执行安装部署 (选项 1)！"; sleep 2; return; fi
     clear; local cfg="/usr/local/etc/sing-box/config.json"
     if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
@@ -669,10 +703,13 @@ modify_sni() {
     echo -en " ${LIGHT_YELLOW} ▶ 请输入新的域名 (留空取消): ${PLAIN}"; read new_sni
     if [[ -n "$new_sni" && "$new_sni" != "$old_sni" ]]; then
         local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
+        # 【修复】移除了 jq 中对旧版 acme 字段的操作，避免修改时出错
         if [[ "$is_reality" == "true" ]]; then
             jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' $cfg > /tmp/sb_tmp.json
         else
-            jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.acme.domain[0] = $sni | .inbounds[0].tls.acme.default_server_name = $sni | .inbounds[0].tls.acme.email = "admin@" + $sni' $cfg > /tmp/sb_tmp.json
+            jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni' $cfg > /tmp/sb_tmp.json
+            yellow "  [注意] 仅修改了配置中的伪装域名。若是真实域名变更，已有证书将不匹配，建议在主菜单选择重新安装！"
+            sleep 3
         fi
         if [ -s /tmp/sb_tmp.json ]; then
             mv -f /tmp/sb_tmp.json $cfg
@@ -728,7 +765,6 @@ showconf() {
 }
 
 setup_chain_outbound() {
-    # 【修复 3】: 阻止依赖不全导致的文件被异常置空
     if ! command -v jq >/dev/null; then red "  [错误] 缺失核心组件(jq)，请先执行安装部署 (选项 1)！"; sleep 2; return; fi
     clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
     local cfg="/usr/local/etc/sing-box/config.json"
@@ -949,7 +985,7 @@ check_keys() {
         yellow "  ▶ 节点短 ID(Sid): $(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)"
         purple "  ▶ Reality 私钥: 已安全存储于 config.json 中"
     else
-        yellow "  ▶ 证书验证模式: 自动 ACME (Let's Encrypt)"
+        yellow "  ▶ 证书验证模式: 本地证书验证 (acme.sh 接管)"
     fi
     echo ""; green "  状态: [✔] 核心参数读取正常。"; echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
