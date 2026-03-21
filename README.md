@@ -1,40 +1,56 @@
-# 🚀 VLESS-Reality 一键部署与管理脚本 (电竞加固版)
+# 🌟 VLESS 多模式全能部署与管理脚本 (修复升级版)
 
-![Bash](https://img.shields.io/badge/Language-Bash-4EAA25?style=flat-square&logo=gnu-bash)
-![Core](https://img.shields.io/badge/Core-sing--box-blue?style=flat-square)
-![Protocol](https://img.shields.io/badge/Protocol-VLESS--Reality-orange?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)
+基于 `sing-box` 核心构建的极简、高效、全能的 VLESS 节点一键部署脚本。专为现代网络环境设计，提供高度自动化的安装体验和智能化的客户端订阅分发。
 
-基于最现代化的 **sing-box** 核心打造，专为**游戏加速**与**高强度网络审查环境**设计的纯 TCP 代理一键部署脚本。
-
-如果你的网络环境（如长城宽带、校园网、公司内网）对 UDP 协议进行了严厉的限速（QoS）或阻断，导致 Hysteria 2 / TUIC 等协议断流卡顿，那么本脚本提供的 **VLESS-TCP-XTLS-Reality** 方案将是你极其稳定、免维护的终极选择。
+🔗 **项目来源**: [哆啦的Github库](https://github.com/yanbinlti-glitch)
 
 ---
 
-## ✨ 核心亮点
+## ✨ 核心特性
 
-- 🛡️ **极致防封锁 (Reality)**：无需购买域名，无需申请 SSL 证书！直接“偷取”微软、苹果等大厂域名的 TLS 特征，将流量完美伪装成正常的网页浏览，抗主动探测能力拉满。
-- ⚡ **现代化核心 (sing-box)**：抛弃老旧架构，采用目前最轻量、内存控制极佳的通用代理平台 `sing-box` 作为底层支撑。
-- 🎮 **电竞级 TCP 优化**：内置 BBR 拥塞控制与 TCP 底层缓冲区调优功能，有效降低跨国 TCP 握手延迟与丢包率。
-- 🔗 **内建智能订阅分发**：无需额外安装 Nginx！自带超轻量级 Python 多线程 Web 服务（内置自签 TLS 加密），一键生成并下发 `Clash Meta` / `Verge` 格式的订阅链接。
-- 🛠️ **极简运维体验**：精美的彩色 UI 交互，支持快捷键 `vvv` 一键唤出菜单；支持动态热更新 Reality 伪装域名 (SNI)。
+* 🚀 **多协议完美支持**
+    * **VLESS + TCP + Reality**: （强烈推荐）无需域名，防主动探测极佳，适合所有裸机 VPS。
+    * **VLESS + TCP + TLS**: 经典直连模式，自动申请 ACME 证书，全站真实伪装。
+    * **VLESS + WS + TLS**: 拯救被墙 IP 的 CDN 救星模式，完美兼容 Cloudflare 小黄云。
+* 📦 **极致轻量且现代**
+    * 采用地表最强的 `sing-box` 核心，性能卓越，资源占用远低于传统 Xray-core。
+* 🔗 **全平台智能订阅下发**
+    * 内置轻量级 Python 订阅服务器。
+    * **自动识别客户端 UA**，为 Clash Meta (Mihomo)、v2rayN、Shadowrocket 等自动下发 YAML 规则或 Base64 订阅。
+* 🌍 **链式代理 (住宅 IP 落地)**
+    * 支持一键导入 `socks5://`, `http://`, `https://` 代理 URI。
+    * 轻松实现静态住宅 IP / 原生 IP 落地，完美解锁 Netflix、ChatGPT、Disney+ 等流媒体与 AI 服务。
+* 🛡️ **极简运维**
+    * 纯自动化依赖安装、防火墙端口放行与清理。
+    * 一键开启 BBR 拥塞控制调优。
+    * 全局快捷命令 `vvv`，随时随地唤出管理菜单。
 
 ---
 
-## 📦 支持的系统
+## 💻 支持的操作系统
 
-脚本已通过底层重构，完美兼容主流的 Linux 发行版，支持 `amd64` / `arm64` 架构：
+脚本已内置完善的系统判定逻辑，支持以下主流 Linux 发行版（需 `root` 权限）：
 
-- **Debian** 10+
-- **Ubuntu** 18.04+
-- **CentOS / AlmaLinux / RockyLinux** 7+
-- **Alpine Linux** (针对 LXC 容器与小内存轻量机型特别优化，支持 OpenRC)
+* **Debian** 9+
+* **Ubuntu** 18.04+
+* **CentOS / RedHat / AlmaLinux / RockyLinux** 7+
+* **Alpine Linux** (原生兼容 rc-service)
+* **Fedora** / **Amazon Linux**
 
 ---
 
-## 🚀 一键安装指南
+## 🚀 安装与使用
 
-请使用 `root` 用户登录你的 VPS，然后复制并运行以下命令即可一键安装部署：
+### 1. 下载并运行脚本
+
+请在 `root` 用户下执行以下命令：
 
 ```bash
-wget -N --no-check-certificate https://raw.githubusercontent.com/yanbinlti-glitch/vless-install/main/vless.sh && sed -i 's/\r$//' vless.sh && bash vless.sh
+# 1. 下载脚本 (假设您的脚本命名为 vless.sh)
+# wget -O vless.sh [https://raw.githubusercontent.com/yanbinlti-glitch/.../vless.sh](https://raw.githubusercontent.com/yanbinlti-glitch/.../vless.sh)
+
+# 2. 赋予执行权限
+chmod +x vless.sh
+
+# 3. 运行脚本
+sudo ./vless.sh
