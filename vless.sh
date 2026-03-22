@@ -122,20 +122,35 @@ check_domain_dns() {
     realip
     local local_ip=$ip
     
-    # 【修复】使用非贪婪正则配合 awk 提取精确 IPv4，避免多条目解析导致漏判
-    local domain_ip=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" 2>/dev/null | grep -o '"data":"[^"]*"' | head -1 | awk -F'"' '{print $4}')
-    [[ -z "$domain_ip" ]] && domain_ip=$(ping -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
+    # 修复：同时查询 A 记录和 AAAA 记录，兼容双栈和纯 IPv6 机器
+    local domain_ipv4=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" 2>/dev/null | grep -o '"data":"[^"]*"' | head -1 | awk -F'"' '{print $4}')
+    [[ -z "$domain_ipv4" ]] && domain_ipv4=$(ping -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
 
-    if [[ "$domain_ip" == "$local_ip" ]]; then
-        green "   [✔] 完美！域名已成功解析到本机 (IP: $domain_ip)"
+    local domain_ipv6=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=AAAA" -H "accept: application/dns-json" 2>/dev/null | grep -o '"data":"[^"]*"' | head -1 | awk -F'"' '{print $4}')
+    [[ -z "$domain_ipv6" ]] && domain_ipv6=$(ping6 -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9a-fA-F]{1,4}:)+[0-9a-fA-F]{1,4}" | head -1)
+
+    if [[ "$domain_ipv4" == "$local_ip" || "$domain_ipv6" == "$local_ip" ]]; then
+        green "   [✔] 完美！域名已成功解析到本机"
         return 0
-    elif [[ -n "$domain_ip" ]]; then
-        red "   [✘] 解析不匹配！本机 IP: $local_ip, 域名 IP: $domain_ip"
+    elif [[ -n "$domain_ipv4" || -n "$domain_ipv6" ]]; then
+        red "   [✘] 解析不匹配！本机 IP: $local_ip"
+        red "       查询到的记录 -> IPv4: ${domain_ipv4:-无} | IPv6: ${domain_ipv6:-无}"
         return 1
     else
-        red "   [✘] 解析失败！未查询到该域名的 A 记录。"
+        red "   [✘] 解析失败！未查询到该域名的 A 或 AAAA 记录。"
         return 1
     fi
+}
+
+stop_services_silently() {
+    # 在重新安装或覆盖时清理遗留进程，避免端口占用检测误报
+    if [[ $SYSTEM == "Alpine" ]]; then
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        rc-service vless-sub stop >/dev/null 2>&1 || true
+    else
+        systemctl stop sing-box vless-sub >/dev/null 2>&1 || true
+    fi
+    pkill -f "vless_server.py" 2>/dev/null || true
 }
 
 # =================================================================
@@ -157,10 +172,17 @@ check_env() {
     green "  [✔] 所有前置依赖补全完成！"; sleep 1
 }
 
-# 【新增】独立 acme.sh 证书申请与管理
 issue_cert() {
     local domain=$1
     echo ""; print_line; yellow "  正在安装 acme.sh 并申请 TLS 证书 (Standalone 模式)..."; echo ""
+    
+    # 修复：先检测 80 端口是否被真正的 Web 服务占用
+    if ss -tnl | grep -E -q ":80( |$)"; then
+        red "  [致命错误] 检测到本机 80 端口已被占用（可能是 Nginx/Apache 等）！"
+        red "  Standalone 模式需要独占 80 端口，请先停止占用程序后再试。"
+        exit 1
+    fi
+
     curl -sL https://get.acme.sh | sh -s email=admin@${domain} >/dev/null 2>&1
     source ~/.bashrc 2>/dev/null || true
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
@@ -181,7 +203,10 @@ issue_cert() {
     close_port 80
     
     /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath /usr/local/etc/sing-box/cert/fullchain.cer --keypath /usr/local/etc/sing-box/cert/private.key --ecc --force >/dev/null 2>&1
-    chmod 644 /usr/local/etc/sing-box/cert/*
+    
+    # 修复：修正权限泄露风险，私钥只许 root 读取
+    chmod 644 /usr/local/etc/sing-box/cert/fullchain.cer
+    chmod 600 /usr/local/etc/sing-box/cert/private.key
     green "  [✔] 证书申请并部署成功！"
 }
 
@@ -195,9 +220,12 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
+    # 修复：防 GitHub API Rate Limit 限制
     local sb_version=$(curl -Ls -o /dev/null -w %{url_effective} "https://github.com/SagerNet/sing-box/releases/latest" | sed 's|.*/tag/v||')
-    [[ -z "$sb_version" ]] && sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败！" && exit 1
+    if [[ -z "$sb_version" || "$sb_version" == *"releases/latest"* ]]; then
+        sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    fi
+    [[ -z "$sb_version" ]] && red " [错误] 获取 sing-box 最新版本失败！请检查网络。" && exit 1
     
     green "  获取到最新版本: v${sb_version}"
     wget --timeout=10 --tries=3 -N -q -O /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${sb_version}/sing-box-${sb_version}-linux-${sb_arch}.tar.gz"
@@ -330,7 +358,6 @@ generate_singbox_config() {
 }
 EOF
 )
-    # 【修复】剥离 1.8.0 废弃的 acme 字段，改为加载本地证书路径
     elif [[ $INSTALL_MODE -eq 2 ]]; then
         json_content=$(cat <<EOF
 {
@@ -349,7 +376,6 @@ EOF
 }
 EOF
 )
-    # 【修复】剥离 1.8.0 废弃的 acme 字段，改为加载本地证书路径
     elif [[ $INSTALL_MODE -eq 3 ]]; then
         json_content=$(cat <<EOF
 {
@@ -405,7 +431,9 @@ generate_client_configs() {
     
     local url=""
     local clash_proxy_yaml=""
+    # 修复：Clash YAML 的 server 必须使用纯 IP（无中括号），而 VLESS URI 可以保留中括号
     local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
+    local raw_ip="$ip"
 
     if [[ "$is_reality" == "true" ]]; then
         local pbk=$(cat /usr/local/etc/sing-box/public_key.meta 2>/dev/null)
@@ -415,7 +443,7 @@ generate_client_configs() {
         clash_proxy_yaml=$(cat <<EOF
   - name: '${node_name}'
     type: vless
-    server: "${uri_ip}"
+    server: "${raw_ip}"
     port: ${port}
     uuid: "${uuid}"
     network: tcp
@@ -504,9 +532,10 @@ EOF
 
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     
-    # 【修复】增加 log_message: pass 屏蔽冗余扫描日志
+    # 优化：增加 socket 超时防御 Slowloris 攻击
     cat << EOF > "$web_dir/vless_server.py"
 import http.server, socketserver, urllib.parse, socket, os
+socket.setdefaulttimeout(10)
 PORT = $sub_port
 SUB_UUID = "$sub_uuid"
 
@@ -587,7 +616,6 @@ EOF
 
 inst_proxy_core() {
     check_env
-    # 【修复】自动接管 TLS 证书申请
     if [[ $INSTALL_MODE -eq 2 || $INSTALL_MODE -eq 3 ]]; then
         issue_cert "$NODE_DOMAIN"
     fi
@@ -644,9 +672,9 @@ inst_mode_menu() {
     echo ""; print_line; echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}返回主菜单${PLAIN}"; print_line; echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 请选择安装模式 [0-3]: ${PLAIN}"; read modeInput
     case $modeInput in
-        1) INSTALL_MODE=1; collect_reality_info; inst_proxy_core ;;
-        2) INSTALL_MODE=2; collect_tls_info; inst_proxy_core ;;
-        3) INSTALL_MODE=3; collect_ws_info; inst_proxy_core ;;
+        1) INSTALL_MODE=1; stop_services_silently; collect_reality_info; inst_proxy_core ;;
+        2) INSTALL_MODE=2; stop_services_silently; collect_tls_info; inst_proxy_core ;;
+        3) INSTALL_MODE=3; stop_services_silently; collect_ws_info; inst_proxy_core ;;
         0) return ;;
         *) red "  无效选择！"; sleep 1; inst_mode_menu ;;
     esac
@@ -703,7 +731,6 @@ modify_sni() {
     echo -en " ${LIGHT_YELLOW} ▶ 请输入新的域名 (留空取消): ${PLAIN}"; read new_sni
     if [[ -n "$new_sni" && "$new_sni" != "$old_sni" ]]; then
         local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
-        # 【修复】移除了 jq 中对旧版 acme 字段的操作，避免修改时出错
         if [[ "$is_reality" == "true" ]]; then
             jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' $cfg > /tmp/sb_tmp.json
         else
@@ -716,7 +743,7 @@ modify_sni() {
             green "  已更新域名为 $new_sni，正在重启并同步订阅..."
             if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
             generate_client_configs
-            green "  更新完成！"
+            green "  更新完成！(建议前往客户端重新刷新订阅)"
         else
             red "  [错误] 配置文件解析失败！"
         fi
@@ -784,7 +811,8 @@ setup_chain_outbound() {
 
     if [[ "$out_type" == "0" ]]; then
         jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
-        if [ -s "$tmp_cfg" ]; then
+        # 优化：验证 jq 处理后的是否为合法 JSON
+        if [ -s "$tmp_cfg" ] && jq . "$tmp_cfg" >/dev/null 2>&1; then
             mv -f "$tmp_cfg" "$cfg"
             if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
             generate_client_configs
@@ -941,7 +969,8 @@ setup_chain_outbound() {
             yellow "  [!] 已设置为【全局强制路由】至住宅 IP。"
         fi
 
-        if [ -s "$tmp_cfg" ]; then
+        # 优化：二次检验 jq 解析输出文件
+        if [ -s "$tmp_cfg" ] && jq . "$tmp_cfg" >/dev/null 2>&1; then
             mv -f "$tmp_cfg" "$cfg"
             if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
             generate_client_configs
@@ -992,7 +1021,7 @@ check_keys() {
 }
 
 # =================================================================
-#  7. 交互主菜单 (保留原版 UI 框架，更替选项 [7])
+#  7. 交互主菜单
 # =================================================================
 menu() {
     clear
@@ -1004,7 +1033,7 @@ menu() {
     echo -e "${LIGHT_GREEN}  ██████╔╝ ╚██████╔╝ ╚██████╔╝███████╗ ██║  ██║${PLAIN}"
     echo -e "${LIGHT_GREEN}  ╚═════╝   ╚══════╝  ╚═════╝ ╚══════╝ ╚═╝  ╚═╝${PLAIN}"
     green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-    green " 项目名称 ：VLESS 多模式全能部署与管理脚本 (修复升级版)"
+    green " 项目名称 ：VLESS 多模式全能部署与管理脚本 (修复优化版)"
     purple " 项目地址 ：哆啦的Github库 https://github.com/yanbinlti-glitch"
     green "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     yellow " 脚本快捷方式：vvv (已自动配置，下次可在终端直接输入 vvv 启动)"
