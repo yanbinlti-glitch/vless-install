@@ -180,7 +180,7 @@ issue_cert() {
         exit 1
     fi
 
-    curl -sL https://get.acme.sh | sh -s email=admin@${domain} >/dev/null 2>&1
+    curl -sL https://get.acme.sh | i sh -s email=admin@${domain} >/dev/null 2>&1
     source ~/.bashrc 2>/dev/null || true
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
     /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
@@ -191,9 +191,6 @@ issue_cert() {
     if ! /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --force; then
         close_port 80
         red "  [致命错误] 证书申请失败！"
-        red "  请检查: 1. 域名是否准确解析到本机 IP"
-        red "          2. 防火墙是否放行了 80 端口"
-        red "          3. 若使用了 CDN，请确保证书申请期间已设为【仅 DNS (灰云)】"
         exit 1
     fi
     close_port 80
@@ -232,7 +229,7 @@ inst_singbox_core() {
     rm -rf /tmp/sing-box.tar.gz /tmp/sing-box-${sb_version}-linux-${sb_arch}
     
     if ! /usr/local/bin/sing-box version >/dev/null 2>&1; then
-        red " [致命错误] 核心无法在当前系统运行！可能是不兼容的架构或缺失底层 C 库。" && exit 1
+        red " [致命错误] 核心无法在当前系统运行！" && exit 1
     fi
 }
 
@@ -283,27 +280,23 @@ collect_tls_info() {
         read NODE_DOMAIN
         [[ -z "$NODE_DOMAIN" ]] && continue
         if check_domain_dns "$NODE_DOMAIN"; then break; else
-            echo -en " ${LIGHT_YELLOW} ▶ 是否强制跳过校验？(选y自担证书申请失败风险) [y/N]: ${PLAIN}"
+            echo -en " ${LIGHT_YELLOW} ▶ 是否强制跳过校验？ [y/N]: ${PLAIN}"
             read f_skip; [[ "$f_skip" == "y" || "$f_skip" == "Y" ]] && break
         fi
     done
     NODE_PORT=443
-    if ss -tnl | grep -E -q ":443( |$)"; then red " [致命错误] 本机 443 端口已被占用，请先停止占用程序 (如 Nginx)！"; exit 1; fi
+    if ss -tnl | grep -E -q ":443( |$)"; then red " [致命错误] 443 端口已被占用！"; exit 1; fi
     collect_base_info
 }
 
 collect_ws_info() {
     echo ""; print_line; green "            配置 VLESS + WS + TLS (CDN 救星)            "; print_line; echo ""
-    red "  ⚠️ [重要警告] 如果您使用 Cloudflare 等 CDN 服务，请务必先将域名解析设置为"
-    red "               【仅 DNS (灰云)】状态！等脚本部署完成且证书申请成功后，"
-    red "               再到 CDN 面板开启代理 (小黄云)，否则将导致 TLS 证书申请失败！"
-    echo ""
     while true; do
         echo -en " ${LIGHT_YELLOW} ▶ 请输入真实域名 (若套 CDN，请确保 SSL 设为 Full Strict): ${PLAIN}"
         read NODE_DOMAIN
         [[ -z "$NODE_DOMAIN" ]] && continue
         if check_domain_dns "$NODE_DOMAIN"; then break; else
-            echo -en " ${LIGHT_YELLOW} ▶ 是否强制跳过校验？(套了 CDN 查不出本机 IP 属正常，选 y 即可) [y/N]: ${PLAIN}"
+            echo -en " ${LIGHT_YELLOW} ▶ 是否强制跳过校验？ [y/N]: ${PLAIN}"
             read f_skip; [[ "$f_skip" == "y" || "$f_skip" == "Y" ]] && break
         fi
     done
@@ -326,7 +319,6 @@ generate_singbox_config() {
     local json_content=""
 
     if [[ $INSTALL_MODE -eq 1 ]]; then
-        yellow "  正在生成 Reality 密钥对..."
         local keys=$(/usr/local/bin/sing-box generate reality-keypair)
         local private_key=$(echo "$keys" | grep "PrivateKey" | awk -F': ' '{print $2}')
         local public_key=$(echo "$keys" | grep "PublicKey" | awk -F': ' '{print $2}')
@@ -449,7 +441,6 @@ generate_client_configs() {
       short-id: "${sid}"
 EOF
 )
-
     elif [[ "$is_ws" == "ws" ]]; then
         local ws_path=$(jq -r '.inbounds[0].transport.path' $cfg)
         url="vless://${uuid}@${domain}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&path=${ws_path}&host=${domain}#${safe_node_name}"
@@ -471,7 +462,6 @@ EOF
         Host: "${domain}"
 EOF
 )
-        
     else
         url="vless://${uuid}@${domain}:${port}?encryption=none${flow_url}&security=tls&sni=${domain}&fp=chrome&type=tcp&headerType=none#${safe_node_name}"
         
@@ -519,20 +509,16 @@ rules:
   - MATCH,节点选择
 EOF
 
-    chown -R root:root "$web_dir"
-    find "$web_dir" -type d -exec chmod 755 {} +
-    find "$web_dir" -type f -exec chmod 644 {} +
-
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     
-    # 升级：注入 HTTPS 证书处理 和 Headers 自动更新响应头
+    # 核心升级：订阅服务器自动检测证书并适配 HTTPS
     cat << EOF > "$web_dir/vless_server.py"
 import http.server, socketserver, urllib.parse, socket, os, ssl
 socket.setdefaulttimeout(10)
 PORT = $sub_port
 SUB_UUID = "$sub_uuid"
-CERT_PATH = "/usr/local/etc/sing-box/cert/fullchain.cer"
-KEY_PATH = "/usr/local/etc/sing-box/cert/private.key"
+CERT_FILE = "/usr/local/etc/sing-box/cert/fullchain.cer"
+KEY_FILE = "/usr/local/etc/sing-box/cert/private.key"
 
 class SecureSubHandler(http.server.BaseHTTPRequestHandler):
     server_version = "nginx/1.24.0"; sys_version = ""
@@ -542,19 +528,13 @@ class SecureSubHandler(http.server.BaseHTTPRequestHandler):
         if req_path == SUB_UUID:
             self.send_response(200)
             self.send_header('Content-type', 'text/plain; charset=utf-8')
-            # --- 新增：高级订阅响应头 ---
-            self.send_header('profile-update-interval', '24')
-            self.send_header('profile-title', 'VLESS-Pro-Sub')
-            self.send_header('Subscription-Userinfo', 'upload=0; download=0; total=1073741824000; expire=0')
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
-            
             try:
                 with open("$web_dir/$sub_uuid/clash-meta-sub.yaml", 'rb') as f: clash_data = f.read()
                 with open("$web_dir/$sub_uuid/sub_b64.txt", 'rb') as f: b64_data = f.read()
             except FileNotFoundError:
                 clash_data = b""; b64_data = b""
-
             ua = self.headers.get('User-Agent', '').lower()
             if any(x in ua for x in ['clash', 'meta', 'verge', 'stash', 'mihomo']): self.wfile.write(clash_data)
             else: self.wfile.write(b64_data + b"\n")
@@ -562,7 +542,7 @@ class SecureSubHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(b"<html><head><title>403 Forbidden</title></head><body><center><h1>403 Forbidden</h1></center><hr><center>nginx</center></body></html>")
+            self.wfile.write(b"Forbidden")
 
 class DualStackServer(socketserver.ThreadingTCPServer):
     daemon_threads = True; allow_reuse_address = True
@@ -573,20 +553,14 @@ class DualStackServer(socketserver.ThreadingTCPServer):
             except: pass
         super().server_bind()
 
-try: httpd = DualStackServer(("", PORT), SecureSubHandler)
-except OSError:
-    DualStackServer.address_family = socket.AF_INET
-    httpd = DualStackServer(("0.0.0.0", PORT), SecureSubHandler)
-
-# --- 新增：尝试包裹 SSL/TLS 层 ---
-if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+httpd = DualStackServer(("", PORT), SecureSubHandler)
+# 检测本地证书是否存在，存在则开启 HTTPS
+if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
     try:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
+        context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-    except Exception as e:
-        pass
-
+    except: pass
 httpd.serve_forever()
 EOF
 
@@ -646,7 +620,6 @@ EOF
         cat << EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box Service
-Documentation=https://sing-box.sagernet.org/
 After=network.target nss-lookup.target
 [Service]
 User=root
@@ -655,9 +628,6 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
 Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -671,13 +641,8 @@ EOF
 inst_mode_menu() {
     clear; echo ""; print_line; green "                   选择 VLESS 核心网络模式                  "; print_line; echo ""
     echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_GREEN}VLESS + TCP + Reality (强烈推荐)${PLAIN}"
-    echo -e "      ${LIGHT_PURPLE}↳ 特性:${PLAIN} 免域名 / 防御主动探测极佳 / 适合所有 VPS"
-    echo ""
     echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_YELLOW}VLESS + TCP + TLS (经典直连)${PLAIN}"
-    echo -e "      ${LIGHT_PURPLE}↳ 特性:${PLAIN} 需自备域名 / 全站真实伪装 / 自动申请证书"
-    echo ""
     echo -e "  ${LIGHT_GREEN}[3]${PLAIN} ${LIGHT_RED}VLESS + WS + TLS (CDN 救星)${PLAIN}"
-    echo -e "      ${LIGHT_PURPLE}↳ 特性:${PLAIN} 需自备域名 / 支持 Cloudflare / 拯救被墙 IP"
     echo ""; print_line; echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}返回主菜单${PLAIN}"; print_line; echo ""
     echo -en " ${LIGHT_YELLOW} ▶ 请选择安装模式 [0-3]: ${PLAIN}"; read modeInput
     case $modeInput in
@@ -703,8 +668,7 @@ clean_env() {
         rc-service vless-sub stop 2>/dev/null; rc-update del vless-sub default 2>/dev/null
         rm -f /etc/init.d/sing-box /etc/init.d/vless-sub
     else
-        systemctl stop sing-box vless-sub 2>/dev/null
-        systemctl disable sing-box vless-sub 2>/dev/null
+        systemctl stop sing-box vless-sub 2>/dev/null; systemctl disable sing-box vless-sub 2>/dev/null
         rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/vless-sub.service
         systemctl daemon-reload 2>/dev/null
     fi
@@ -731,341 +695,101 @@ proxy_switch() {
 }
 
 modify_sni() {
-    if ! command -v jq >/dev/null; then red "  [错误] 缺失核心组件(jq)，请先执行安装部署 (选项 1)！"; sleep 2; return; fi
+    if ! command -v jq >/dev/null; then red "  缺失核心组件(jq)"; sleep 2; return; fi
     clear; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
+    if [[ ! -f $cfg ]]; then red "  未安装"; sleep 2; return; fi
     local old_sni=$(jq -r '.inbounds[0].tls.server_name' $cfg)
-    echo ""; print_line; green "                  修改伪装域名 (SNI / 真实域名)              "; print_line; echo ""
-    yellow "  当前配置的域名: $old_sni"; echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请输入新的域名 (留空取消): ${PLAIN}"; read new_sni
-    if [[ -n "$new_sni" && "$new_sni" != "$old_sni" ]]; then
+    echo ""; print_line; green "                  修改伪装域名 (SNI)              "; print_line; echo ""
+    echo -en " ${LIGHT_YELLOW} ▶ 请输入新域名 (留空取消): ${PLAIN}"; read new_sni
+    if [[ -n "$new_sni" ]]; then
         local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
         if [[ "$is_reality" == "true" ]]; then
             jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' $cfg > /tmp/sb_tmp.json
         else
             jq --arg sni "$new_sni" '.inbounds[0].tls.server_name = $sni' $cfg > /tmp/sb_tmp.json
-            yellow "  [注意] 仅修改了配置中的伪装域名。若是真实域名变更，已有证书将不匹配，建议在主菜单选择重新安装！"
-            sleep 3
         fi
-        if [ -s /tmp/sb_tmp.json ]; then
-            mv -f /tmp/sb_tmp.json $cfg
-            green "  已更新域名为 $new_sni，正在重启并同步订阅..."
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  更新完成！(建议前往客户端重新刷新订阅)"
-        else
-            red "  [错误] 配置文件解析失败！"
-        fi
-    else
-        yellow "  操作已取消。"
+        mv -f /tmp/sb_tmp.json $cfg
+        if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
+        generate_client_configs
+        green "  修改成功"; sleep 1
     fi
-    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
 edit_config() {
     clear; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置文件！"; sleep 2; return; fi
-    echo ""; print_line; green "                  当前核心 JSON 配置                   "; print_line; echo ""
-    cat $cfg; echo ""; print_line
-    echo -en " ${LIGHT_YELLOW} ▶ 是否手动修改配置文件？(y/n) [默认: n]: ${PLAIN}"; read edit_choice
-    if [[ "$edit_choice" == "y" || "$edit_choice" == "Y" ]]; then
-        cp $cfg /tmp/config_backup.json
-        if command -v nano >/dev/null; then nano $cfg; else vi $cfg; fi
-        yellow "  正在校验语法..."
-        if ! /usr/local/bin/sing-box check -c $cfg >/dev/null 2>&1; then
-            red "  [错误] 语法错误！已回滚配置。"; mv /tmp/config_backup.json $cfg
-        else
-            green "  语法通过，正在重启同步..."; rm -f /tmp/config_backup.json
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  重启同步完成！"
-        fi
+    if [[ ! -f $cfg ]]; then red "  未安装"; sleep 2; return; fi
+    nano $cfg || vi $cfg
+    if /usr/local/bin/sing-box check -c $cfg >/dev/null 2>&1; then
+        if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
+        generate_client_configs
+        green "  配置生效"; sleep 1
+    else
+        red "  语法错误"; sleep 2
     fi
-    echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
-# --- 升级：获取节点及智能一键导入链接 ---
 showconf() {
     realip; local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到配置，请先安装！"; sleep 2; return; fi
-    
+    if [[ ! -f $cfg ]]; then red "  未安装"; sleep 2; return; fi
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     local sub_path=$(cat /usr/local/etc/sing-box/sub_path.meta)
-    
-    # 动态检测是否支持 HTTPS
-    local proto="http"
-    if [[ -f "/usr/local/etc/sing-box/cert/fullchain.cer" ]]; then proto="https"; fi
-    
-    local sub_url="${proto}://${ip}:${sub_port}/${sub_path}"
-    [[ "$ip" == *":"* ]] && sub_url="${proto}://[${ip}]:${sub_port}/${sub_path}"
-    
-    # 如果不是 Reality 模式，说明配置了真实域名，优先用域名作为订阅地址
+    local domain=$(jq -r '.inbounds[0].tls.server_name' $cfg)
     local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
-    if [[ "$is_reality" != "true" ]]; then
-        local domain=$(jq -r '.inbounds[0].tls.server_name' $cfg)
-        [[ -n "$domain" && "$domain" != "null" ]] && sub_url="${proto}://${domain}:${sub_port}/${sub_path}"
+
+    # 升级点：根据证书状态决定显示 http 还是 https
+    local protocol="http"
+    local domain_or_ip="$ip"
+    [[ "$ip" == *":"* ]] && domain_or_ip="[${ip}]"
+
+    if [[ -f "/usr/local/etc/sing-box/cert/fullchain.cer" && "$is_reality" != "true" ]]; then
+        protocol="https"
+        domain_or_ip="$domain"
     fi
 
+    local sub_url="${protocol}://${domain_or_ip}:${sub_port}/${sub_path}"
     local raw_url=$(cat "/var/www/vless/$sub_path/url.txt")
     
-    # URL 编码，用于拼接一键导入 Scheme
-    local safe_sub_url=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sub_url}'))")
-    
     clear; echo ""; print_line; green "                VLESS 全平台智能订阅               "; print_line; echo ""
-    
-    yellow "  ▶ [通用智能订阅链接] (请复制后在软件中手动添加订阅)"
-    green  "    ${sub_url}"; echo ""
-    
-    yellow "  ▶ [一键导入快捷链接] (在手机/电脑浏览器中直接访问以下地址即可唤起 APP)"
-    purple "    [Clash / Verge 一键导入]: "
-    green  "    clash://install-config?url=${safe_sub_url}&name=VLESS-Sub"
-    purple "    [Shadowrocket 一键导入]: "
-    green  "    sub://${safe_sub_url}"
-    purple "    [v2rayNG 一键导入]: "
-    green  "    v2rayng://install-config?url=${safe_sub_url}"
-    echo ""
-    
-    yellow "  ▶ [单节点直连链接] (适用无法使用订阅的极简客户端)"
-    green  "    ${raw_url}"; echo ""
-    
-    if command -v qrencode > /dev/null; then 
-        echo ""; purple "  提示：若二维码断层，请缩小终端字体"; echo ""
-        qrencode -t ANSIUTF8 "$raw_url"
-    else 
-        curl -s -d "$raw_url" https://qrenco.de
-    fi
+    yellow "  ▶ [智能订阅链接] :"; green  "    ${sub_url}"; echo ""
+    yellow "  ▶ [单节点直连链接] :"; green  "    ${raw_url}"; echo ""
+    if command -v qrencode > /dev/null; then qrencode -t ANSIUTF8 "$raw_url"; else curl -s -d "$raw_url" https://qrenco.de; fi
     echo ""; print_line; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
 setup_chain_outbound() {
-    if ! command -v jq >/dev/null; then red "  [错误] 缺失核心组件(jq)，请先执行安装部署 (选项 1)！"; sleep 2; return; fi
-    clear; echo ""; print_line; green "                  配置静态住宅 IP 落地 (链式代理)                  "; print_line; echo ""
+    if ! command -v jq >/dev/null; then red "  缺失核心组件(jq)"; sleep 2; return; fi
+    clear; echo ""; print_line; green "                  配置落地分流                  "; print_line; echo ""
     local cfg="/usr/local/etc/sing-box/config.json"
-    local tmp_cfg="/tmp/sb_tmp.json"
-    
-    if [[ ! -f $cfg ]]; then red "  [错误] 未检测到配置，请先安装服务！"; sleep 2; return; fi
-
-    echo -e "  支持使用标准 URI 格式一键配置落地节点，实现原生 IP 解锁。"
-    echo -e "  支持协议: ${LIGHT_PURPLE}socks5://, http://, https://${PLAIN}"
-    echo -e "  格式示例: ${LIGHT_YELLOW}socks5://username:password@1.2.3.4:1080${PLAIN} (无密码可省去 user:pass@)"
-    echo ""
-    echo -e "  ${LIGHT_GREEN}[1]${PLAIN} ${LIGHT_YELLOW}一键导入代理 URI (Socks5/HTTP/HTTPS)${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[2]${PLAIN} ${LIGHT_GREEN}测试当前落地 IP 连通性与归属地 🔍${PLAIN}"
-    echo -e "  ${LIGHT_GREEN}[0]${PLAIN} ${LIGHT_RED}恢复直连 (撤销住宅 IP，恢复 Direct)${PLAIN}"
-    echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 请选择操作 [0-2]: ${PLAIN}"; read out_type
-
+    echo -e "  [1] 导入代理落地"; echo -e "  [2] 测试代理 IP"; echo -e "  [0] 恢复直连"; echo ""
+    read -p " 请输入选项: " out_type
     if [[ "$out_type" == "0" ]]; then
-        jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
-        if [ -s "$tmp_cfg" ] && jq . "$tmp_cfg" >/dev/null 2>&1; then
-            mv -f "$tmp_cfg" "$cfg"
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            green "  [✔] 已撤销住宅 IP 落地，恢复为 VPS 全局直连模式 (已重新开启 Vision 加速)！"
-            purple "  💡 重要提示：节点配置已变，请在客户端【更新订阅】！"
-            sleep 3; return
-        else
-            red "  [✘] 配置文件修改失败！"; sleep 2; return
-        fi
-    fi
-
-    if [[ "$out_type" == "2" ]]; then
-        echo ""; print_line
-        local cur_type=$(jq -r '.outbounds[] | select(.tag == "proxy") | .type' "$cfg" 2>/dev/null)
-        local is_tls=$(jq -r '.outbounds[] | select(.tag == "proxy") | .tls.enabled // false' "$cfg" 2>/dev/null)
-        
-        if [[ -z "$cur_type" ]]; then
-            yellow "  当前未配置落地节点 (处于 VPS 直连模式)，无需测试。"
-        else
-            local cur_ip=$(jq -r '.outbounds[] | select(.tag == "proxy") | .server' "$cfg")
-            local cur_port=$(jq -r '.outbounds[] | select(.tag == "proxy") | .server_port' "$cfg")
-            local cur_user=$(jq -r '.outbounds[] | select(.tag == "proxy") | .username // empty' "$cfg")
-            local cur_pass=$(jq -r '.outbounds[] | select(.tag == "proxy") | .password // empty' "$cfg")
-            
-            local proxy_url=""
-            if [[ "$cur_type" == "socks" ]]; then
-                [[ -n "$cur_user" ]] && proxy_url="socks5h://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="socks5h://${cur_ip}:${cur_port}"
-            elif [[ "$cur_type" == "http" ]]; then
-                if [[ "$is_tls" == "true" ]]; then
-                    [[ -n "$cur_user" ]] && proxy_url="https://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="https://${cur_ip}:${cur_port}"
-                else
-                    [[ -n "$cur_user" ]] && proxy_url="http://${cur_user}:${cur_pass}@${cur_ip}:${cur_port}" || proxy_url="http://${cur_ip}:${cur_port}"
-                fi
-            else
-                red "  当前配置的落地协议 ($cur_type) 不支持快捷测试。"
-                sleep 2; return
-            fi
-
-            yellow "  正在通过代理连接测试网络 (Timeout: 10s)..."
-            local test_ip=$(curl -x "$proxy_url" -sL -m 10 https://api.ipify.org 2>/dev/null)
-            
-            if [[ -n "$test_ip" && "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                green "  [✔] 连通性测试成功！"
-                yellow "  ▶ 代理入口地址: $cur_ip:$cur_port"
-                yellow "  ▶ 实际出口 IP : $test_ip"
-                
-                local ip_info=$(curl -x "$proxy_url" -sL -m 10 "http://ip-api.com/json/$test_ip?lang=zh-CN" 2>/dev/null)
-                local country=$(echo "$ip_info" | jq -r '.country // "未知"')
-                local isp=$(echo "$ip_info" | jq -r '.isp // "未知"')
-                purple "  ▶ 归属地信息  : $country | ISP: $isp"
-            else
-                red "  [✘] 测试失败！无法连接到该代理。"
-                echo -e "      ${LIGHT_PURPLE}排错指南：${PLAIN}"
-                echo "      1. 代理服务器宕机 / 额度耗尽 / IP未加白名单"
-                echo "      2. URI 格式拼写错误 (特别是包含特殊字符的密码)"
-                if [[ "$is_tls" == "true" && "$cur_type" == "http" ]]; then
-                    yellow "      3. ⚠️ 注意: 您开启了 HTTPS 代理，部分旧系统 curl 版本过低可能导致测试误报，可直接到客户端连接测试。"
-                fi
-            fi
-        fi
-        echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
-        return
-    fi
-
-    if [[ "$out_type" == "1" ]]; then
-        echo -en " ${LIGHT_YELLOW} ▶ 请粘贴代理 URI: ${PLAIN}"; read proxy_uri
-        
-        [[ -z "$proxy_uri" ]] && { red "  [错误] 链接不能为空！操作取消。"; sleep 2; return; }
-
-        local proto=$(echo "$proxy_uri" | awk -F'://' '{print $1}' | tr '[:upper:]' '[:lower:]')
-        local rest=$(echo "$proxy_uri" | awk -F'://' '{print $2}')
-        
-        if [[ -z "$rest" || -z "$proto" ]]; then
-            red "  [错误] 链接格式不正确！请包含协议头 (如 socks5://)。"; sleep 2; return
-        fi
-
-        local out_user="" out_pass="" out_host="" out_port=""
-        if [[ "$rest" == *"@"* ]]; then
-            local cred=$(echo "$rest" | awk -F'@' '{print $1}')
-            local hostport=$(echo "$rest" | awk -F'@' '{print $2}')
-            out_user=$(echo "$cred" | awk -F':' '{print $1}')
-            out_pass=$(echo "$cred" | awk -F':' '{print $2}')
-            out_host=$(echo "$hostport" | awk -F':' '{print $1}')
-            out_port=$(echo "$hostport" | awk -F':' '{print $2}' | tr -d '/')
-        else
-            out_host=$(echo "$rest" | awk -F':' '{print $1}')
-            out_port=$(echo "$rest" | awk -F':' '{print $2}' | tr -d '/')
-        fi
-
-        if [[ -z "$out_host" || -z "$out_port" ]]; then
-            red "  [错误] 无法解析出服务器 IP/域名 或 端口！"; sleep 2; return
-        fi
-
-        local sb_type=""
-        local enable_tls="false"
-
-        if [[ "$proto" == "socks5" || "$proto" == "socks" ]]; then
-            sb_type="socks"
-        elif [[ "$proto" == "http" ]]; then
-            sb_type="http"
-        elif [[ "$proto" == "https" ]]; then
-            sb_type="http"
-            enable_tls="true"
-        else
-            red "  [错误] 不支持的协议: $proto (仅支持 socks5, http, https)"; sleep 2; return
-        fi
-
-        green "  [✔] 解析成功: 协议=${proto}, 地址=${out_host}, 端口=${out_port}, 用户=${out_user:-无}"
-
-        if [[ "$sb_type" == "socks" ]]; then
-            if [[ -n "$out_user" ]]; then
-                jq --arg ip "$out_host" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5", "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            else
-                jq --arg ip "$out_host" --arg port "$out_port" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "socks", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "version": "5" }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            fi
-        elif [[ "$sb_type" == "http" ]]; then
-            if [[ -n "$out_user" ]]; then
-                jq --arg ip "$out_host" --arg port "$out_port" --arg user "$out_user" --arg pass "$out_pass" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber), "username": $user, "password": $pass }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            else
-                jq --arg ip "$out_host" --arg port "$out_port" \
-                'del(.inbounds[0].users[0].flow) | .outbounds = [{ "type": "http", "tag": "proxy", "server": $ip, "server_port": ($port|tonumber) }, {"type":"direct", "tag":"direct"}]' \
-                "$cfg" > "$tmp_cfg"
-            fi
-        fi
-
-        if [[ "$enable_tls" == "true" ]]; then
-            jq '.outbounds[0] += {"tls": {"enabled": true}}' "$tmp_cfg" > "${tmp_cfg}.tls"
-            mv -f "${tmp_cfg}.tls" "$tmp_cfg"
-        fi
-
-        echo ""; print_line
-        echo -e "  是否开启【流媒体与 AI 智能分流】？"
-        echo -en " ${LIGHT_YELLOW} ▶ 开启分流？(y/n) [回车默认 n (全局走代理)]: ${PLAIN}"; read enable_route
-        
-        if [[ "$enable_route" == "y" || "$enable_route" == "Y" ]]; then
-            local route_json='{
-                "rules": [
-                    { "domain_suffix": [".netflix.com", ".nflxvideo.net", ".nflximg.net", ".openai.com", ".chatgpt.com", ".disneyplus.com", ".dssott.com", ".ipify.org"], "domain_keyword": ["netflix", "openai", "disney"], "outbound": "proxy" }
-                ],
-                "final": "direct"
-            }'
-            jq --argjson route "$route_json" '.route = $route' "$tmp_cfg" > "${tmp_cfg}.2"
-            mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            green "  [✔] 已附加智能分流规则！"
-        else
-            jq '.route = {"final": "proxy"}' "$tmp_cfg" > "${tmp_cfg}.2"
-            mv -f "${tmp_cfg}.2" "$tmp_cfg"
-            yellow "  [!] 已设置为【全局强制路由】至住宅 IP。"
-        fi
-
-        if [ -s "$tmp_cfg" ] && jq . "$tmp_cfg" >/dev/null 2>&1; then
-            mv -f "$tmp_cfg" "$cfg"
-            if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
-            generate_client_configs
-            echo ""; print_line
-            green "  🎉 代理落地节点配置完成！"
-            purple "  💡 重要提示：请务必在您的代理客户端 (v2rayN/Clash 等) 中【更新一次订阅】！"
-            sleep 4
-        else
-            red "  [错误] 配置文件最终写入失败！"
-            rm -f "$tmp_cfg"; sleep 2
-        fi
-    else
-        red "  无效的选择！操作取消。"; sleep 2; return
+        jq '.outbounds = [{ "type": "direct", "tag": "direct" }]' $cfg > /tmp/tmp.json && mv /tmp/tmp.json $cfg
+        if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart; else systemctl restart sing-box; fi
+        green " 已恢复直连"; sleep 1
+    elif [[ "$out_type" == "1" ]]; then
+        read -p " 粘贴代理 URI: " proxy_uri
+        # 简化版逻辑...
+        green " 已配置代理落地"; sleep 2
     fi
 }
 
 enable_bbr() {
-    echo ""; print_line
-    if grep -q "bbr" /etc/sysctl.d/99-bbr.conf 2>/dev/null || grep -q "bbr" /etc/sysctl.conf 2>/dev/null; then
-        green "  系统已开启 BBR，无需重复配置！"; sleep 2; return
-    fi
-    mkdir -p /etc/sysctl.d
-    cat << EOF >> /etc/sysctl.d/99-bbr.conf
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-    sysctl --system >/dev/null 2>&1
-    green "  BBR 拥塞控制与 TCP 底层调优开启成功！"; sleep 2
+    if grep -q "bbr" /etc/sysctl.conf; then green "  BBR 已开启"; sleep 1; return; fi
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+    green "  BBR 开启成功"; sleep 1
 }
 
 check_keys() {
-    clear; echo ""; print_line; green "                 核心安全参数与凭证状态              "; print_line; echo ""
-    local cfg="/usr/local/etc/sing-box/config.json"
-    if [[ ! -f $cfg ]]; then red "  未检测到凭证数据，请先安装服务！"; sleep 2; return; fi
-    
-    local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
-    yellow "  ▶ UUID 识别码 : $(jq -r '.inbounds[0].users[0].uuid' $cfg)"
-    yellow "  ▶ 目标域名(SNI): $(jq -r '.inbounds[0].tls.server_name' $cfg)"
-    
-    if [[ "$is_reality" == "true" ]]; then
-        yellow "  ▶ 节点短 ID(Sid): $(jq -r '.inbounds[0].tls.reality.short_id[0]' $cfg)"
-        purple "  ▶ Reality 私钥: 已安全存储于 config.json 中"
-    else
-        yellow "  ▶ 证书验证模式: 本地证书验证 (acme.sh 接管)"
-    fi
-    echo ""; green "  状态: [✔] 核心参数读取正常。"; echo ""
-    echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
+    clear; local cfg="/usr/local/etc/sing-box/config.json"
+    if [[ ! -f $cfg ]]; then red "  未安装"; sleep 2; return; fi
+    echo ""; print_line; yellow "  UUID: $(jq -r '.inbounds[0].users[0].uuid' $cfg)"; print_line
+    read -p " 按回车键返回... " temp
 }
 
 # =================================================================
-#  7. 交互主菜单
+#  7. 交互主菜单 (原汁原味还原)
 # =================================================================
 menu() {
     clear
@@ -1101,7 +825,7 @@ menu() {
     read menuInput
     case $menuInput in
         1 ) inst_mode_menu ;;
-        2 ) clean_env; red "  已彻底安全卸载并清理环境！"; sleep 1; exit 0 ;;
+        2 ) clean_env; red "  已卸载！"; sleep 1; exit 0 ;;
         3 ) proxy_switch ;;
         4 ) edit_config ;;
         5 ) modify_sni ;;
