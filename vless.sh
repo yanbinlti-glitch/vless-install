@@ -122,7 +122,6 @@ check_domain_dns() {
     realip
     local local_ip=$ip
     
-    # 修复：同时查询 A 记录和 AAAA 记录，兼容双栈和纯 IPv6 机器
     local domain_ipv4=$(curl -sm5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" -H "accept: application/dns-json" 2>/dev/null | grep -o '"data":"[^"]*"' | head -1 | awk -F'"' '{print $4}')
     [[ -z "$domain_ipv4" ]] && domain_ipv4=$(ping -c1 -W1 "$domain" 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
 
@@ -143,7 +142,6 @@ check_domain_dns() {
 }
 
 stop_services_silently() {
-    # 在重新安装或覆盖时清理遗留进程，避免端口占用检测误报
     if [[ $SYSTEM == "Alpine" ]]; then
         rc-service sing-box stop >/dev/null 2>&1 || true
         rc-service vless-sub stop >/dev/null 2>&1 || true
@@ -176,7 +174,6 @@ issue_cert() {
     local domain=$1
     echo ""; print_line; yellow "  正在安装 acme.sh 并申请 TLS 证书 (Standalone 模式)..."; echo ""
     
-    # 修复：先检测 80 端口是否被真正的 Web 服务占用
     if ss -tnl | grep -E -q ":80( |$)"; then
         red "  [致命错误] 检测到本机 80 端口已被占用（可能是 Nginx/Apache 等）！"
         red "  Standalone 模式需要独占 80 端口，请先停止占用程序后再试。"
@@ -190,7 +187,6 @@ issue_cert() {
     
     mkdir -p /usr/local/etc/sing-box/cert
     
-    # 申请前临时放行 80 端口
     open_port 80
     if ! /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --force; then
         close_port 80
@@ -204,7 +200,6 @@ issue_cert() {
     
     /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath /usr/local/etc/sing-box/cert/fullchain.cer --keypath /usr/local/etc/sing-box/cert/private.key --ecc --force >/dev/null 2>&1
     
-    # 修复：修正权限泄露风险，私钥只许 root 读取
     chmod 644 /usr/local/etc/sing-box/cert/fullchain.cer
     chmod 600 /usr/local/etc/sing-box/cert/private.key
     green "  [✔] 证书申请并部署成功！"
@@ -220,7 +215,6 @@ inst_singbox_core() {
         *) red " [错误] 不支持的架构: $arch" && exit 1 ;;
     esac
     
-    # 修复：防 GitHub API Rate Limit 限制
     local sb_version=$(curl -Ls -o /dev/null -w %{url_effective} "https://github.com/SagerNet/sing-box/releases/latest" | sed 's|.*/tag/v||')
     if [[ -z "$sb_version" || "$sb_version" == *"releases/latest"* ]]; then
         sb_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
@@ -431,7 +425,6 @@ generate_client_configs() {
     
     local url=""
     local clash_proxy_yaml=""
-    # 修复：Clash YAML 的 server 必须使用纯 IP（无中括号），而 VLESS URI 可以保留中括号
     local uri_ip="$ip"; [[ "$ip" == *":"* ]] && uri_ip="[$ip]"
     local raw_ip="$ip"
 
@@ -532,12 +525,14 @@ EOF
 
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     
-    # 优化：增加 socket 超时防御 Slowloris 攻击
+    # 升级：注入 HTTPS 证书处理 和 Headers 自动更新响应头
     cat << EOF > "$web_dir/vless_server.py"
-import http.server, socketserver, urllib.parse, socket, os
+import http.server, socketserver, urllib.parse, socket, os, ssl
 socket.setdefaulttimeout(10)
 PORT = $sub_port
 SUB_UUID = "$sub_uuid"
+CERT_PATH = "/usr/local/etc/sing-box/cert/fullchain.cer"
+KEY_PATH = "/usr/local/etc/sing-box/cert/private.key"
 
 class SecureSubHandler(http.server.BaseHTTPRequestHandler):
     server_version = "nginx/1.24.0"; sys_version = ""
@@ -547,6 +542,10 @@ class SecureSubHandler(http.server.BaseHTTPRequestHandler):
         if req_path == SUB_UUID:
             self.send_response(200)
             self.send_header('Content-type', 'text/plain; charset=utf-8')
+            # --- 新增：高级订阅响应头 ---
+            self.send_header('profile-update-interval', '24')
+            self.send_header('profile-title', 'VLESS-Pro-Sub')
+            self.send_header('Subscription-Userinfo', 'upload=0; download=0; total=1073741824000; expire=0')
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
             
@@ -578,6 +577,16 @@ try: httpd = DualStackServer(("", PORT), SecureSubHandler)
 except OSError:
     DualStackServer.address_family = socket.AF_INET
     httpd = DualStackServer(("0.0.0.0", PORT), SecureSubHandler)
+
+# --- 新增：尝试包裹 SSL/TLS 层 ---
+if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    except Exception as e:
+        pass
+
 httpd.serve_forever()
 EOF
 
@@ -775,19 +784,56 @@ edit_config() {
     echo ""; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
+# --- 升级：获取节点及智能一键导入链接 ---
 showconf() {
     realip; local cfg="/usr/local/etc/sing-box/config.json"
     if [[ ! -f $cfg ]]; then red "  未检测到配置，请先安装！"; sleep 2; return; fi
+    
     local sub_port=$(cat /usr/local/etc/sing-box/sub_port.meta)
     local sub_path=$(cat /usr/local/etc/sing-box/sub_path.meta)
-    local sub_url="http://${ip}:${sub_port}/${sub_path}"
-    [[ "$ip" == *":"* ]] && sub_url="http://[${ip}]:${sub_port}/${sub_path}"
+    
+    # 动态检测是否支持 HTTPS
+    local proto="http"
+    if [[ -f "/usr/local/etc/sing-box/cert/fullchain.cer" ]]; then proto="https"; fi
+    
+    local sub_url="${proto}://${ip}:${sub_port}/${sub_path}"
+    [[ "$ip" == *":"* ]] && sub_url="${proto}://[${ip}]:${sub_port}/${sub_path}"
+    
+    # 如果不是 Reality 模式，说明配置了真实域名，优先用域名作为订阅地址
+    local is_reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' $cfg)
+    if [[ "$is_reality" != "true" ]]; then
+        local domain=$(jq -r '.inbounds[0].tls.server_name' $cfg)
+        [[ -n "$domain" && "$domain" != "null" ]] && sub_url="${proto}://${domain}:${sub_port}/${sub_path}"
+    fi
+
     local raw_url=$(cat "/var/www/vless/$sub_path/url.txt")
     
+    # URL 编码，用于拼接一键导入 Scheme
+    local safe_sub_url=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sub_url}'))")
+    
     clear; echo ""; print_line; green "                VLESS 全平台智能订阅               "; print_line; echo ""
-    yellow "  ▶ [智能订阅链接] (适用 Clash Meta / v2rayN / Shadowrocket)"; green  "    ${sub_url}"; echo ""
-    yellow "  ▶ [单节点直连链接] (适用 NekoBox / v2rayNG 直导)"; green  "    ${raw_url}"; echo ""
-    if command -v qrencode > /dev/null; then echo ""; purple "  提示：若二维码断层，请缩小终端字体"; echo ""; qrencode -t ANSIUTF8 "$raw_url"; else curl -s -d "$raw_url" https://qrenco.de; fi
+    
+    yellow "  ▶ [通用智能订阅链接] (请复制后在软件中手动添加订阅)"
+    green  "    ${sub_url}"; echo ""
+    
+    yellow "  ▶ [一键导入快捷链接] (在手机/电脑浏览器中直接访问以下地址即可唤起 APP)"
+    purple "    [Clash / Verge 一键导入]: "
+    green  "    clash://install-config?url=${safe_sub_url}&name=VLESS-Sub"
+    purple "    [Shadowrocket 一键导入]: "
+    green  "    sub://${safe_sub_url}"
+    purple "    [v2rayNG 一键导入]: "
+    green  "    v2rayng://install-config?url=${safe_sub_url}"
+    echo ""
+    
+    yellow "  ▶ [单节点直连链接] (适用无法使用订阅的极简客户端)"
+    green  "    ${raw_url}"; echo ""
+    
+    if command -v qrencode > /dev/null; then 
+        echo ""; purple "  提示：若二维码断层，请缩小终端字体"; echo ""
+        qrencode -t ANSIUTF8 "$raw_url"
+    else 
+        curl -s -d "$raw_url" https://qrenco.de
+    fi
     echo ""; print_line; echo -en " ${LIGHT_YELLOW} ▶ 按回车键返回主菜单... ${PLAIN}"; read temp
 }
 
@@ -811,7 +857,6 @@ setup_chain_outbound() {
 
     if [[ "$out_type" == "0" ]]; then
         jq 'del(.route) | .outbounds = [{ "type": "direct", "tag": "direct" }] | if .inbounds[0].transport.type != "ws" then .inbounds[0].users[0].flow = "xtls-rprx-vision" else . end' "$cfg" > "$tmp_cfg"
-        # 优化：验证 jq 处理后的是否为合法 JSON
         if [ -s "$tmp_cfg" ] && jq . "$tmp_cfg" >/dev/null 2>&1; then
             mv -f "$tmp_cfg" "$cfg"
             if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
@@ -969,7 +1014,6 @@ setup_chain_outbound() {
             yellow "  [!] 已设置为【全局强制路由】至住宅 IP。"
         fi
 
-        # 优化：二次检验 jq 解析输出文件
         if [ -s "$tmp_cfg" ] && jq . "$tmp_cfg" >/dev/null 2>&1; then
             mv -f "$tmp_cfg" "$cfg"
             if [[ $SYSTEM == "Alpine" ]]; then rc-service sing-box restart >/dev/null 2>&1; else systemctl restart sing-box >/dev/null 2>&1; fi
